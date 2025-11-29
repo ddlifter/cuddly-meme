@@ -1,0 +1,5 @@
+# opentde extension
+comment = 'Open Transparent Data Encryption for PostgreSQL'
+default_version = '1.0'
+module_pathname = '$libdir/opentde'
+relocatable = true
