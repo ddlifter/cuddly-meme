@@ -5,10 +5,9 @@ DATA = opentde--1.0.sql
 # Имя разделяемой библиотеки (.so)
 MODULE_big = opentde
 # Список исходников для компиляции
-OBJS = src/opentde.o src/opentde_am.o src/opentde_wal.o src/opentde_crypto.o src/kuznechik.o
+OBJS = src/opentde_am.o src/kuznechik.o
 # Подключаем конфигурацию PostgreSQL
-# ВАЖНО: pg_config должен быть из ТВОЕЙ сборки (export PATH=...)
-PG_CONFIG = pg_config
+PG_CONFIG = /home/ddlifter/diploma/pg_build/bin/pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 

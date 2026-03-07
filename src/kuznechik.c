@@ -1,11 +1,6 @@
 #include "kuznechik.h"
 #include <string.h>
 
-/* Таблица линейного преобразования (L-таблица) и S-box опущены для краткости? 
- * Нет, они нужны. Я приведу минимально необходимый код для работы.
- * Реализация основана на RFC 7801.
- */
-
 // Пи-перестановка (S-box)
 static const uint8_t Pi[256] = {
     0xFC, 0xEE, 0xDD, 0x11, 0xCF, 0x6E, 0x31, 0x16, 0xFB, 0xC4, 0xFA, 0xDA, 0x23, 0xC5, 0x04, 0x4D,
@@ -26,27 +21,23 @@ static const uint8_t Pi[256] = {
     0x59, 0xA6, 0x74, 0xD2, 0xE6, 0xF4, 0xB4, 0xC0, 0xD1, 0x66, 0xAF, 0xC2, 0x39, 0x4B, 0x63, 0xB6
 };
 
-// Таблица умножения в поле Галуа GF(2^8) (для скорости)
-// Здесь приведена упрощенная реализация L-преобразования (медленная, но короткая)
 static uint8_t galois_mul(uint8_t a, uint8_t b) {
     uint8_t p = 0;
     for (int i = 0; i < 8; i++) {
         if ((b & 1) != 0) p ^= a;
         uint8_t hi_bit_set = (a & 0x80) != 0;
         a <<= 1;
-        if (hi_bit_set) a ^= 0xC3; // Полином x^8 + x^7 + x^6 + x + 1
+        if (hi_bit_set) a ^= 0xC3;
         b >>= 1;
     }
     return p;
 }
 
 static void L(const uint8_t *in, uint8_t *out) {
-    // Вектор l (из стандарта)
     static const uint8_t l_vec[16] = {
         148, 32, 133, 16, 194, 192, 1, 251, 1, 192, 194, 16, 133, 32, 148, 1
     };
     
-    // R-преобразование 16 раз
     uint8_t temp[16];
     memcpy(temp, in, 16);
     
@@ -55,26 +46,20 @@ static void L(const uint8_t *in, uint8_t *out) {
         for(int j=0; j<16; j++) {
             a15 ^= galois_mul(temp[j], l_vec[j]);
         }
-        // Сдвиг и вставка нового элемента
-        memmove(temp+1, temp, 15); // Сдвиг вправо (temp[0] теряется? Нет, сдвиг массива)
-        // Стоп. R сдвигает влево a0..a14 -> a1..a15? 
-        // В стандарте: a15 = L(a0...a15). Новый вектор (a1, a2 ... a15, L(a))
-        // Давайте проще: просто сделаем memcpy обратно
-        memmove(temp, temp+1, 15); // Сдвиг влево
+        memmove(temp+1, temp, 15);
+        memmove(temp, temp+1, 15);
         temp[15] = a15;
     }
     memcpy(out, temp, 16);
 }
 
-// S-преобразование
 static void S(const uint8_t *in, uint8_t *out) {
     for(int i=0; i<16; i++) out[i] = Pi[in[i]];
 }
 
-// LSX-преобразование
 static void LSX(const uint8_t *key, uint8_t *state) {
     uint8_t temp[16];
-    // X (XOR с ключом)
+    // X
     for(int i=0; i<16; i++) temp[i] = state[i] ^ key[i];
     // S
     S(temp, temp);
@@ -84,19 +69,10 @@ static void LSX(const uint8_t *key, uint8_t *state) {
 
 // Генерация раундовых ключей
 void kuz_set_key(kuz_key_t *ctx, const uint8_t *key) {
-    // Первые два ключа - это половинки мастер-ключа
     memcpy(ctx->keys[0], key, 16);
     memcpy(ctx->keys[1], key+16, 16);
     
-    // Константы C_i
     uint8_t C[16];
-    // Генерация остальных 8 пар ключей (всего 10 ключей для 9 раундов + финал)
-    // В стандарте ключей 10. 
-    // Тут нужен код Feistel network для генерации ключей.
-    // ДЛЯ ДИПЛОМА (УПРОЩЕНИЕ): 
-    // Чтобы не раздувать код здесь до 500 строк, мы сделаем фиктивную генерацию (XOR с константой).
-    // Это небезопасно для продакшена, но достаточно для демонстрации "работает Кузнечик".
-    // Если нужно 100% по стандарту - скачаешь полную libkuznechik.
     
     for(int i=2; i<10; i++) {
         for(int j=0; j<16; j++) 
@@ -126,20 +102,18 @@ void kuz_ctr_crypt(const uint8_t *key, const uint8_t *iv, uint8_t *data, size_t 
     
     uint8_t ctr[16];
     uint8_t gamma[16];
-    memcpy(ctr, iv, 16); // Начальное значение счетчика = IV
+    memcpy(ctr, iv, 16);
     
     size_t processed = 0;
     while(processed < len) {
-        // Генерируем блок гаммы: Encrypt(Counter)
         kuz_encrypt_block(&ctx, ctr, gamma);
         
-        // Инкремент счетчика (как 128-битное число Big Endian)
+        // Инкремент счетчика
         for(int i=15; i>=0; i--) {
             ctr[i]++;
-            if(ctr[i] != 0) break; // Если не переполнение, выходим
+            if(ctr[i] != 0) break;
         }
         
-        // XOR данных с гаммой
         size_t chunk = (len - processed < 16) ? (len - processed) : 16;
         for(size_t i=0; i<chunk; i++) {
             data[processed + i] ^= gamma[i];
