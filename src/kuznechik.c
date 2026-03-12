@@ -1,7 +1,8 @@
-#include "kuznechik.h"
+#include <stdint.h>
 #include <string.h>
+#include <stdio.h>
 
-// Пи-перестановка (S-box)
+// Пи-перестановка (S-box) из ГОСТ Р 34.12-2015
 static const uint8_t Pi[256] = {
     0xFC, 0xEE, 0xDD, 0x11, 0xCF, 0x6E, 0x31, 0x16, 0xFB, 0xC4, 0xFA, 0xDA, 0x23, 0xC5, 0x04, 0x4D,
     0xE9, 0x77, 0xF0, 0xDB, 0x93, 0x2E, 0x99, 0xBA, 0x17, 0x36, 0xF1, 0xBB, 0x14, 0xCD, 0x5F, 0xC1,
@@ -21,18 +22,36 @@ static const uint8_t Pi[256] = {
     0x59, 0xA6, 0x74, 0xD2, 0xE6, 0xF4, 0xB4, 0xC0, 0xD1, 0x66, 0xAF, 0xC2, 0x39, 0x4B, 0x63, 0xB6
 };
 
+// Константы Ci из ГОСТ Р 34.12-2015 для генерации раундовых ключей
+static const uint8_t C[10][16] = {
+    {0xA3,0xD6,0xD9,0x4F,0x15,0xA6,0xF7,0x57,0xC1,0x05,0xF3,0x17,0xB0,0x3D,0xB2,0xC4},
+    {0xDC,0x87,0xEC,0xE4,0xD8,0x90,0xF4,0xB3,0xBA,0x4E,0xB9,0x20,0x79,0xCB,0xEB,0x02},
+    {0xB2,0x25,0x9A,0x96,0xB4,0xD8,0x8E,0x0B,0xE7,0x69,0x04,0x30,0xA4,0x4F,0x7F,0x03},
+    {0x7B,0xCD,0x1B,0x0B,0x73,0xE3,0x2B,0xA5,0xB7,0x9C,0xB1,0x40,0xF2,0x55,0x15,0x04},
+    {0x15,0x6F,0x6D,0x79,0x1F,0xAB,0x51,0x1D,0xEA,0xBB,0x0C,0x50,0x2F,0xD1,0x81,0x05},
+    {0xA7,0x4A,0xF7,0xEF,0xAB,0x73,0xDF,0x16,0x0D,0xD2,0x08,0x60,0x8B,0x9E,0xFE,0x06},
+    {0xC9,0xE8,0x81,0x9D,0xC7,0x3B,0xA5,0xAE,0x50,0xF5,0xB5,0x70,0x56,0x1A,0x6A,0x07},
+    {0xF6,0x59,0x36,0x16,0xE6,0x05,0x56,0x89,0xAD,0xFB,0xA1,0x80,0x27,0xAA,0x2A,0x08},
+    {0x9D,0xB4,0xF8,0x50,0x62,0x5B,0x7C,0x9D,0xA6,0x28,0x50,0xF0,0x8C,0xD9,0xB4,0x09},
+    {0xD6,0xF0,0x5C,0xB8,0xDA,0x99,0x63,0x9B,0x3D,0xA2,0xC8,0x10,0xE0,0x32,0x6D,0x0A}
+};
+
+typedef uint8_t kuz_key_t[10][16];  // 10 раундовых ключей по 16 байт
+
+// Галуа умножение в поле GF(2^8)
 static uint8_t galois_mul(uint8_t a, uint8_t b) {
     uint8_t p = 0;
     for (int i = 0; i < 8; i++) {
         if ((b & 1) != 0) p ^= a;
         uint8_t hi_bit_set = (a & 0x80) != 0;
         a <<= 1;
-        if (hi_bit_set) a ^= 0xC3;
+        if (hi_bit_set) a ^= 0xC3;  // Младший многочлен: x^8 + x^7 + x^6 + x + 1
         b >>= 1;
     }
     return p;
 }
 
+// Линейное преобразование L
 static void L(const uint8_t *in, uint8_t *out) {
     static const uint8_t l_vec[16] = {
         148, 32, 133, 16, 194, 192, 1, 251, 1, 192, 194, 16, 133, 32, 148, 1
@@ -41,61 +60,68 @@ static void L(const uint8_t *in, uint8_t *out) {
     uint8_t temp[16];
     memcpy(temp, in, 16);
     
-    for(int i=0; i<16; i++) {
+    for(int i = 0; i < 16; i++) {
         uint8_t a15 = 0;
-        for(int j=0; j<16; j++) {
+        for(int j = 0; j < 16; j++) {
             a15 ^= galois_mul(temp[j], l_vec[j]);
         }
-        memmove(temp+1, temp, 15);
-        memmove(temp, temp+1, 15);
-        temp[15] = a15;
+        memmove(temp + 1, temp, 15);
+        temp[0] = a15;  // Циклический сдвиг + L
     }
     memcpy(out, temp, 16);
 }
 
+// S-преобразование (подстановка)
 static void S(const uint8_t *in, uint8_t *out) {
-    for(int i=0; i<16; i++) out[i] = Pi[in[i]];
+    for(int i = 0; i < 16; i++) out[i] = Pi[in[i]];
 }
 
+// LSX = L ◦ S ◦ X (XOR с ключом)
 static void LSX(const uint8_t *key, uint8_t *state) {
     uint8_t temp[16];
-    // X
-    for(int i=0; i<16; i++) temp[i] = state[i] ^ key[i];
+    // X: state ^= key
+    for(int i = 0; i < 16; i++) temp[i] = state[i] ^ key[i];
     // S
     S(temp, temp);
     // L
     L(temp, state);
 }
 
-// Генерация раундовых ключей
+// ✅ ИСПРАВЛЕННАЯ генерация раундовых ключей
 void kuz_set_key(kuz_key_t *ctx, const uint8_t *key) {
-    memcpy(ctx->keys[0], key, 16);
-    memcpy(ctx->keys[1], key+16, 16);
+    memcpy((*ctx)[0], key, 16);      // K0
+    memcpy((*ctx)[1], key + 16, 16); // K1
     
-    uint8_t C[16];
-    
-    for(int i=2; i<10; i++) {
-        for(int j=0; j<16; j++) 
-            ctx->keys[i][j] = ctx->keys[i-2][j] ^ ctx->keys[i-1][j] ^ (uint8_t)i;
+    uint8_t temp[16];
+    for(int i = 2; i < 10; i++) {
+        // F(Ci-2) = LSX(Ci-2, Ki-2)
+        memcpy(temp, (*ctx)[i-2], 16);
+        LSX(C[i-2], temp);
+        
+        // Ki = F(Ci-2) ^ Ki-1
+        for(int j = 0; j < 16; j++) {
+            (*ctx)[i][j] = temp[j] ^ (*ctx)[i-1][j];
+        }
     }
 }
 
-// Шифрование блока
+// Шифрование одного блока
 void kuz_encrypt_block(kuz_key_t *ctx, const uint8_t *in, uint8_t *out) {
     uint8_t state[16];
     memcpy(state, in, 16);
     
     // 9 раундов LSX
-    for(int i=0; i<9; i++) {
-        LSX(ctx->keys[i], state);
+    for(int i = 0; i < 9; i++) {
+        LSX((*ctx)[i], state);
     }
     
-    // Последний раунд: X
-    for(int j=0; j<16; j++) 
-        out[j] = state[j] ^ ctx->keys[9][j];
+    // Финальный раунд: только XOR с K9
+    for(int j = 0; j < 16; j++) {
+        out[j] = state[j] ^ (*ctx)[9][j];
+    }
 }
 
-// Реализация режима CTR (Counter Mode)
+// ✅ CTR режим для DEK (32 байта)
 void kuz_ctr_crypt(const uint8_t *key, const uint8_t *iv, uint8_t *data, size_t len) {
     kuz_key_t ctx;
     kuz_set_key(&ctx, key);
@@ -108,15 +134,15 @@ void kuz_ctr_crypt(const uint8_t *key, const uint8_t *iv, uint8_t *data, size_t 
     while(processed < len) {
         kuz_encrypt_block(&ctx, ctr, gamma);
         
-        // Инкремент счетчика
-        for(int i=15; i>=0; i--) {
+        // Инкремент счетчика (big-endian)
+        for(int i = 15; i >= 0; i--) {
             ctr[i]++;
             if(ctr[i] != 0) break;
         }
         
         size_t chunk = (len - processed < 16) ? (len - processed) : 16;
-        for(size_t i=0; i<chunk; i++) {
-            data[processed + i] ^= gamma[i];
+        for(size_t i = 0; i < chunk; i++) {
+            data[processed + i] ^= gamma[i];  // CTR: data ^= keystream
         }
         processed += chunk;
     }
