@@ -9,11 +9,13 @@
  *
  *   tuple_insert          — вставка с шифрованием payload
  *   tuple_update          — обновление с шифрованием нового кортежа
+ *   tuple_lock            — блокировка кортежа с дешифрованием (нужен для UPDATE)
  *   multi_insert          — массовая вставка (COPY) с шифрованием
  *   scan_getnextslot      — последовательное чтение с дешифрованием
  *   relation_toast_am     — TOAST-таблица создаётся как обычная heap
  *   index_build_range_scan — построение индекса с дешифрованием
  *   index_fetch_tuple     — извлечение по индексу с дешифрованием
+ *   tuple_fetch_row_version — повторная выборка кортежа (EPQ) с дешифрованием
  *
  * Все остальные методы (tuple_delete, vacuum, analyze и т.д.) делегируются
  * стандартному heap AM без изменений.
@@ -69,6 +71,72 @@ static bool opentde_index_fetch_tuple(struct IndexFetchTableData *scan,
                                       Snapshot snapshot,
                                       TupleTableSlot *slot,
                                       bool *call_again, bool *all_dead);
+static TM_Result opentde_tuple_lock(Relation relation, ItemPointer tid,
+                                    Snapshot snapshot, TupleTableSlot *slot,
+                                    CommandId cid, LockTupleMode mode,
+                                    LockWaitPolicy wait_policy,
+                                    uint8 flags, TM_FailureData *tmfd);
+static bool opentde_tuple_fetch_row_version(Relation relation,
+                                            ItemPointer tid,
+                                            Snapshot snapshot,
+                                            TupleTableSlot *slot);
+
+/* =====================================================================
+ * Вспомогательная функция: дешифрование кортежа в слоте
+ *
+ * Используется всеми callback-ами, которые читают кортежи с диска:
+ * scan_getnextslot, index_fetch_tuple, tuple_lock, tuple_fetch_row_version.
+ *
+ * Алгоритм:
+ *   1. Извлекает HeapTuple из слота (материализует при необходимости)
+ *   2. Создаёт копию (чтобы не модифицировать буферную страницу)
+ *   3. Находит IV по TID
+ *   4. Расшифровывает payload (всё после t_hoff)
+ *   5. Помещает расшифрованную копию обратно в слот
+ * ===================================================================== */
+static void
+opentde_decrypt_slot(Oid table_oid, TupleTableSlot *slot)
+{
+    bool            should_free;
+    HeapTuple       tuple;
+    HeapTuple       decrypted;
+    char           *payload;
+    int             payload_len;
+    uint8_t         row_iv[DATA_IV_SIZE];
+    ItemPointerData saved_tid;
+
+    saved_tid = slot->tts_tid;
+
+    tuple = ExecFetchSlotHeapTuple(slot, true, &should_free);
+    if (!tuple)
+        return;
+
+    /* Рабочая копия — оригинал может указывать в буферную страницу */
+    decrypted = heap_copytuple(tuple);
+    decrypted->t_self = tuple->t_self;
+
+    payload     = (char *) decrypted->t_data + decrypted->t_data->t_hoff;
+    payload_len = decrypted->t_len - decrypted->t_data->t_hoff;
+
+    if (payload_len > 0)
+    {
+        if (!opentde_lookup_tuple_iv(table_oid, &decrypted->t_self, row_iv))
+            ereport(ERROR,
+                    (errcode(ERRCODE_INTERNAL_ERROR),
+                     errmsg("missing tuple IV for table %u block %u offset %u",
+                            table_oid,
+                            ItemPointerGetBlockNumber(&decrypted->t_self),
+                            ItemPointerGetOffsetNumber(&decrypted->t_self))));
+
+        opentde_gost_encrypt_decrypt(payload, payload_len, table_oid, row_iv);
+    }
+
+    ExecForceStoreHeapTuple(decrypted, slot, true);
+    slot->tts_tid = saved_tid;
+
+    if (should_free)
+        heap_freetuple(tuple);
+}
 
 /* =====================================================================
  * INSERT — вставка одного кортежа
@@ -259,16 +327,9 @@ opentde_scan_getnextslot(TableScanDesc sscan,
                          TupleTableSlot *slot)
 {
     const TableAmRoutine *heap_am;
-    bool        found;
-    bool        should_free;
-    HeapTuple   tuple;
-    HeapTuple   decrypted_tuple;
-    char       *dec_payload;
-    int         dec_len;
-    ItemPointerData tid;
-    Relation    relation;
-    Oid         table_oid;
-    uint8_t     row_iv[DATA_IV_SIZE];
+    bool     found;
+    Relation relation;
+    Oid      table_oid;
 
     heap_am   = GetHeapamTableAmRoutine();
     relation  = sscan->rs_rd;
@@ -279,52 +340,8 @@ opentde_scan_getnextslot(TableScanDesc sscan,
     if (!found)
         return false;
 
-    tuple = ExecFetchSlotHeapTuple(slot, true, &should_free);
-    if (!tuple)
-        return true;
-
-    /* Создаём рабочую копию для дешифрования (не трогаем буферную страницу) */
-    decrypted_tuple = heap_copytuple(tuple);
-    decrypted_tuple->t_self = tuple->t_self;
-    tid = tuple->t_self;
-
-    dec_payload = (char *) decrypted_tuple->t_data + decrypted_tuple->t_data->t_hoff;
-    dec_len = decrypted_tuple->t_len - decrypted_tuple->t_data->t_hoff;
-
-    if (dec_len > 0)
-    {
-        /* Поиск IV для данного кортежа */
-        if (!opentde_lookup_tuple_iv(table_oid, &tid, row_iv))
-            ereport(ERROR,
-                    (errcode(ERRCODE_INTERNAL_ERROR),
-                     errmsg("missing tuple IV for table %u block %u offset %u",
-                            table_oid,
-                            ItemPointerGetBlockNumber(&tid),
-                            ItemPointerGetOffsetNumber(&tid)),
-                     errhint("Rows inserted before this fix may need re-encryption.")));
-
-        elog(LOG, "[OpenTDE] scan_decrypt tid=(%u,%u) CIPH first4=[%02x %02x %02x %02x]",
-             (unsigned) ItemPointerGetBlockNumber(&tid),
-             (unsigned) ItemPointerGetOffsetNumber(&tid),
-             (unsigned char) dec_payload[0], (unsigned char) dec_payload[1],
-             (unsigned char) dec_payload[2], (unsigned char) dec_payload[3]);
-
-        /* Дешифрование payload (CTR-режим: повторное применение = расшифровка) */
-        opentde_gost_encrypt_decrypt(dec_payload, dec_len, table_oid, row_iv);
-
-        elog(LOG, "[OpenTDE] scan_decrypt tid=(%u,%u) PLAIN first4=[%02x %02x %02x %02x]",
-             (unsigned) ItemPointerGetBlockNumber(&tid),
-             (unsigned) ItemPointerGetOffsetNumber(&tid),
-             (unsigned char) dec_payload[0], (unsigned char) dec_payload[1],
-             (unsigned char) dec_payload[2], (unsigned char) dec_payload[3]);
-    }
-
-    /* Помещаем расшифрованный кортеж обратно в слот */
-    ExecForceStoreHeapTuple(decrypted_tuple, slot, true);
-    slot->tts_tid = tid;
-
-    if (should_free)
-        heap_freetuple(tuple);
+    /* Дешифрование payload в слоте */
+    opentde_decrypt_slot(table_oid, slot);
 
     return true;
 }
@@ -358,15 +375,8 @@ opentde_index_fetch_tuple(struct IndexFetchTableData *scan,
                           bool *call_again, bool *all_dead)
 {
     const TableAmRoutine *heap_am;
-    bool        found;
-    bool        should_free;
-    HeapTuple   tuple;
-    HeapTuple   decrypted;
-    Oid         table_oid;
-    char       *payload;
-    int         payload_len;
-    uint8_t     row_iv[DATA_IV_SIZE];
-    ItemPointerData saved_tid;
+    bool found;
+    Oid  table_oid;
 
     /* Делегируем чтение heap AM */
     heap_am = GetHeapamTableAmRoutine();
@@ -376,37 +386,64 @@ opentde_index_fetch_tuple(struct IndexFetchTableData *scan,
         return false;
 
     table_oid = RelationGetRelid(scan->rel);
-    saved_tid = slot->tts_tid;
+    opentde_decrypt_slot(table_oid, slot);
 
-    tuple = ExecFetchSlotHeapTuple(slot, true, &should_free);
-    if (!tuple)
-        return true;
+    return true;
+}
 
-    /* Рабочая копия для дешифрования */
-    decrypted = heap_copytuple(tuple);
-    decrypted->t_self = tuple->t_self;
+/* =====================================================================
+ * TUPLE LOCK — блокировка кортежа с дешифрованием
+ *
+ * Вызывается executor-ом перед UPDATE/DELETE для блокировки строки.
+ * Стандартная heap-реализация читает кортеж с диска в слот.
+ * Без нашего переопределения слот содержит зашифрованные данные,
+ * и executor строит новый кортеж UPDATE из мусора.
+ *
+ * Это была корневая причина бага «UPDATE портит не-SET столбцы».
+ * ===================================================================== */
+static TM_Result
+opentde_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
+                   TupleTableSlot *slot, CommandId cid, LockTupleMode mode,
+                   LockWaitPolicy wait_policy, uint8 flags,
+                   TM_FailureData *tmfd)
+{
+    const TableAmRoutine *heap_am;
+    TM_Result result;
 
-    payload     = (char *) decrypted->t_data + decrypted->t_data->t_hoff;
-    payload_len = decrypted->t_len - decrypted->t_data->t_hoff;
+    heap_am = GetHeapamTableAmRoutine();
+    result = heap_am->tuple_lock(relation, tid, snapshot, slot, cid,
+                                 mode, wait_policy, flags, tmfd);
 
-    if (payload_len > 0)
-    {
-        if (!opentde_lookup_tuple_iv(table_oid, &decrypted->t_self, row_iv))
-            ereport(ERROR,
-                    (errcode(ERRCODE_INTERNAL_ERROR),
-                     errmsg("missing tuple IV for table %u block %u offset %u",
-                            table_oid,
-                            ItemPointerGetBlockNumber(&decrypted->t_self),
-                            ItemPointerGetOffsetNumber(&decrypted->t_self))));
+    if (result != TM_Ok)
+        return result;
 
-        opentde_gost_encrypt_decrypt(payload, payload_len, table_oid, row_iv);
-    }
+    /* Кортеж заблокирован; в слоте зашифрованные данные — расшифровываем */
+    opentde_decrypt_slot(RelationGetRelid(relation), slot);
 
-    ExecForceStoreHeapTuple(decrypted, slot, true);
-    slot->tts_tid = saved_tid;
+    return result;
+}
 
-    if (should_free)
-        heap_freetuple(tuple);
+/* =====================================================================
+ * TUPLE FETCH ROW VERSION — повторная выборка конкретной версии кортежа
+ *
+ * Используется для EvalPlanQual (EPQ) при SERIALIZABLE-изоляции,
+ * проверке внешних ключей и других случаях, когда PostgreSQL
+ * перечитывает конкретную версию строки по TID.
+ * ===================================================================== */
+static bool
+opentde_tuple_fetch_row_version(Relation relation, ItemPointer tid,
+                                Snapshot snapshot, TupleTableSlot *slot)
+{
+    const TableAmRoutine *heap_am;
+    bool found;
+
+    heap_am = GetHeapamTableAmRoutine();
+    found = heap_am->tuple_fetch_row_version(relation, tid, snapshot, slot);
+
+    if (!found)
+        return false;
+
+    opentde_decrypt_slot(RelationGetRelid(relation), slot);
 
     return true;
 }
@@ -546,13 +583,15 @@ _PG_init(void)
     opentde_tableam_methods.type = T_TableAmRoutine;
 
     /* Подмена callback-ов шифрующими версиями */
-    opentde_tableam_methods.tuple_insert          = opentde_tuple_insert;
-    opentde_tableam_methods.tuple_update          = opentde_tuple_update;
-    opentde_tableam_methods.multi_insert          = opentde_multi_insert;
-    opentde_tableam_methods.scan_getnextslot      = opentde_scan_getnextslot;
-    opentde_tableam_methods.relation_toast_am     = opentde_relation_toast_am;
+    opentde_tableam_methods.tuple_insert           = opentde_tuple_insert;
+    opentde_tableam_methods.tuple_update           = opentde_tuple_update;
+    opentde_tableam_methods.tuple_lock             = opentde_tuple_lock;
+    opentde_tableam_methods.multi_insert           = opentde_multi_insert;
+    opentde_tableam_methods.scan_getnextslot       = opentde_scan_getnextslot;
+    opentde_tableam_methods.relation_toast_am      = opentde_relation_toast_am;
     opentde_tableam_methods.index_build_range_scan = opentde_index_build_range_scan;
-    opentde_tableam_methods.index_fetch_tuple     = opentde_index_fetch_tuple;
+    opentde_tableam_methods.index_fetch_tuple      = opentde_index_fetch_tuple;
+    opentde_tableam_methods.tuple_fetch_row_version = opentde_tuple_fetch_row_version;
 
     /* Инициализация менеджера ключей */
     opentde_init_key_manager();
