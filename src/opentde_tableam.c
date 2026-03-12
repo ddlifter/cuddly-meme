@@ -143,8 +143,8 @@ opentde_decrypt_slot(Oid table_oid, TupleTableSlot *slot)
  *
  * Алгоритм:
  *   1. Материализуем кортеж из слота (ExecFetchSlotHeapTuple)
- *   2. Вызываем стандартный heap_insert (handles TOAST, xmin, WAL)
- *   3. Шифруем payload прямо в буферной странице
+ *   2. Шифруем payload в памяти (Kuznechik-CTR)
+ *   3. Вызываем heap_insert — в WAL попадают зашифрованные данные
  *   4. Регистрируем IV для нового TID
  * ===================================================================== */
 static void
@@ -161,18 +161,18 @@ opentde_tuple_insert(Relation relation,
     int       payload_len;
 
     table_oid = RelationGetRelid(relation);
-    elog(DEBUG1, "[OpenTDE] Encrypting INSERT for table %u", table_oid);
 
     tuple = ExecFetchSlotHeapTuple(slot, true, &should_free);
     if (!tuple)
         return;
 
     /*
-     * Сначала вставляем открытый кортеж — heap обрабатывает TOAST,
-     * проставляет xmin/cmin, пишет WAL и т.д.
-     * Затем шифруем payload на буферной странице до того,
-     * как другой бэкенд сможет увидеть закоммиченные данные.
+     * Шифруем payload ДО heap_insert — WAL получит зашифрованные данные.
+     * heap_insert запишет зашифрованный кортеж и на страницу,
+     * и в WAL-журнал.
      */
+    payload_len = opentde_encrypt_tuple_inplace(tuple, table_oid, row_iv);
+
     heap_insert(relation, tuple, cid, options, bistate);
 
     if (!ItemPointerIsValid(&tuple->t_self))
@@ -180,9 +180,7 @@ opentde_tuple_insert(Relation relation,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("heap insert did not produce a valid tuple TID")));
 
-    /* Шифрование payload в буферной странице */
-    payload_len = opentde_encrypt_in_buffer(relation, table_oid,
-                                            &tuple->t_self, row_iv);
+    /* Регистрируем IV для полученного TID */
     if (payload_len > 0)
         opentde_register_tuple_iv(table_oid, &tuple->t_self, row_iv);
 
@@ -195,8 +193,8 @@ opentde_tuple_insert(Relation relation,
 /* =====================================================================
  * UPDATE — обновление кортежа
  *
- * Аналогично INSERT: heap_update создаёт новую версию кортежа,
- * затем мы шифруем payload новой версии и регистрируем для неё IV.
+ * Аналогично INSERT: сначала шифруем payload новой версии,
+ * затем heap_update создаёт новую версию с зашифрованными данными.
  * Старая версия остаётся зашифрованной (со своим IV).
  * ===================================================================== */
 static TM_Result
@@ -219,47 +217,26 @@ opentde_tuple_update(Relation relation,
     int        payload_len;
 
     table_oid = RelationGetRelid(relation);
-    elog(DEBUG1, "[OpenTDE] Encrypting UPDATE for table %u", table_oid);
 
     tuple = ExecFetchSlotHeapTuple(slot, true, &should_free);
     if (!tuple)
         return TM_Invisible;
 
-    /* Проставляем OID таблицы на новой версии (как это делает heapam) */
     slot->tts_tableOid = RelationGetRelid(relation);
     tuple->t_tableOid  = slot->tts_tableOid;
 
-    elog(LOG, "[OpenTDE] tuple_update NEW hoff=%u tlen=%u id_bytes=[%02x %02x %02x %02x]",
-        (unsigned) tuple->t_data->t_hoff, (unsigned) tuple->t_len,
-        (unsigned char) ((char*)tuple->t_data)[tuple->t_data->t_hoff + 0],
-        (unsigned char) ((char*)tuple->t_data)[tuple->t_data->t_hoff + 1],
-        (unsigned char) ((char*)tuple->t_data)[tuple->t_data->t_hoff + 2],
-        (unsigned char) ((char*)tuple->t_data)[tuple->t_data->t_hoff + 3]);
-
     /*
-     * Вызываем heap_update: создаём новую версию, помечаем старую мёртвой,
-     * обрабатываем TOAST, HOT, WAL и т.д.
+     * Шифруем payload ДО heap_update — WAL получит зашифрованные данные.
      */
+    payload_len = opentde_encrypt_tuple_inplace(tuple, table_oid, row_iv);
+
     result = heap_update(relation, otid, tuple, cid, crosscheck, wait,
                          tmfd, lockmode, update_indexes);
 
-    elog(LOG, "[OpenTDE] heap_update result=%d otid=(%u,%u) new_tid=(%u,%u)",
-        (int) result,
-        (unsigned) ItemPointerGetBlockNumber(otid),
-        (unsigned) ItemPointerGetOffsetNumber(otid),
-        (unsigned) ItemPointerGetBlockNumber(&tuple->t_self),
-        (unsigned) ItemPointerGetOffsetNumber(&tuple->t_self));
-
     ItemPointerCopy(&tuple->t_self, &slot->tts_tid);
 
-    if (result == TM_Ok)
-    {
-        /* Шифруем payload новой версии кортежа */
-        payload_len = opentde_encrypt_in_buffer(relation, table_oid,
-                                                &tuple->t_self, row_iv);
-        if (payload_len > 0)
-            opentde_register_tuple_iv(table_oid, &tuple->t_self, row_iv);
-    }
+    if (result == TM_Ok && payload_len > 0)
+        opentde_register_tuple_iv(table_oid, &tuple->t_self, row_iv);
 
     if (should_free)
         heap_freetuple(tuple);
@@ -270,8 +247,8 @@ opentde_tuple_update(Relation relation,
 /* =====================================================================
  * MULTI INSERT — массовая вставка (используется в COPY)
  *
- * Все кортежи сначала вставляются через heap_multi_insert,
- * затем каждый шифруется на своей буферной странице.
+ * Каждый кортеж шифруется в памяти ДО heap_multi_insert,
+ * затем массово вставляется — WAL получает зашифрованные данные.
  * ===================================================================== */
 static void
 opentde_multi_insert(Relation relation,
@@ -281,35 +258,52 @@ opentde_multi_insert(Relation relation,
                      int options,
                      BulkInsertState bistate)
 {
-    Oid table_oid;
-    int i;
+    Oid      table_oid;
+    int      i;
+    uint8_t (*ivs)[DATA_IV_SIZE];
 
     table_oid = RelationGetRelid(relation);
-    elog(DEBUG1, "[OpenTDE] Encrypting MULTI_INSERT (%d rows) for table %u",
-         nslots, table_oid);
+
+    /* Массив IV — по одному на каждый кортеж */
+    ivs = palloc(nslots * sizeof(*ivs));
 
     /*
-     * Массовая вставка открытых кортежей.
-     * После вызова каждый slot->tts_tid содержит TID на диске.
+     * Шифруем каждый кортеж ДО массовой вставки.
+     * Получаем HeapTuple из слота, шифруем payload,
+     * кладём зашифрованный кортеж обратно в слот.
      */
-    heap_multi_insert(relation, slots, nslots, cid, options, bistate);
-
-    /* Шифрование каждого кортежа в его буферной странице */
     for (i = 0; i < nslots; i++)
     {
-        uint8_t row_iv[DATA_IV_SIZE];
-        int     payload_len;
+        bool      should_free;
+        HeapTuple tuple;
+        HeapTuple encrypted;
 
-        if (!ItemPointerIsValid(&slots[i]->tts_tid))
-            ereport(ERROR,
-                    (errcode(ERRCODE_INTERNAL_ERROR),
-                     errmsg("heap multi_insert did not set a valid TID for slot %d", i)));
+        tuple = ExecFetchSlotHeapTuple(slots[i], true, &should_free);
+        if (!tuple)
+        {
+            memset(ivs[i], 0, DATA_IV_SIZE);
+            continue;
+        }
 
-        payload_len = opentde_encrypt_in_buffer(relation, table_oid,
-                                                &slots[i]->tts_tid, row_iv);
-        if (payload_len > 0)
-            opentde_register_tuple_iv(table_oid, &slots[i]->tts_tid, row_iv);
+        encrypted = heap_copytuple(tuple);
+        opentde_encrypt_tuple_inplace(encrypted, table_oid, ivs[i]);
+        ExecForceStoreHeapTuple(encrypted, slots[i], true);
+
+        if (should_free)
+            heap_freetuple(tuple);
     }
+
+    /* Массовая вставка зашифрованных кортежей */
+    heap_multi_insert(relation, slots, nslots, cid, options, bistate);
+
+    /* Регистрация IV для каждого назначенного TID */
+    for (i = 0; i < nslots; i++)
+    {
+        if (ItemPointerIsValid(&slots[i]->tts_tid))
+            opentde_register_tuple_iv(table_oid, &slots[i]->tts_tid, ivs[i]);
+    }
+
+    pfree(ivs);
 }
 
 /* =====================================================================

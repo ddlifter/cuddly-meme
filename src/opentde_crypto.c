@@ -7,17 +7,19 @@
  *   - Получение или создание DEK для конкретной таблицы
  *   - Шифрование/дешифрование данных шифром «Кузнечик» (ГОСТ Р 34.12-2015)
  *     в режиме CTR (гаммирование)
- *   - Шифрование payload кортежа непосредственно в буферной странице
+ *   - Шифрование payload кортежа в памяти перед записью в heap
  *
  * Схема шифрования:
  *   1. Для каждого кортежа генерируется случайный 128-битный IV
  *   2. DEK таблицы используется как ключ шифра «Кузнечик»
  *   3. Шифрование выполняется в режиме CTR: XOR открытого текста с гаммой
  *   4. Дешифрование — повторное применение той же операции (CTR симметричен)
+ *
+ * Шифрование выполняется ДО вызова heap_insert/heap_update/heap_multi_insert,
+ * чтобы в WAL-журнал попадали уже зашифрованные данные.
  */
 #include "opentde.h"
 
-#include "access/generic_xlog.h"   /* GenericXLogState */
 #include "port.h"                  /* PG_BINARY */
 
 #include <string.h>
@@ -190,83 +192,37 @@ opentde_gost_encrypt_decrypt(char *data, int len, Oid table_oid,
 }
 
 /* =====================================================================
- * Шифрование кортежа в буферной странице
+ * Шифрование кортежа в памяти (перед записью в heap)
  * ===================================================================== */
 
 /*
- * Шифрование payload кортежа, только что записанного в heap-буфер.
+ * Шифрование payload кортежа в памяти (in-place).
  *
- * Алгоритм:
- *   1. Читает буферную страницу, содержащую кортеж (по TID)
- *   2. Блокирует страницу эксклюзивно (BUFFER_LOCK_EXCLUSIVE)
- *   3. Находит кортеж по смещению (OffsetNumber)
- *   4. Генерирует случайный IV (128 бит)
- *   5. Шифрует payload (всё после t_hoff) шифром «Кузнечик» CTR
- *   6. Фиксирует изменения через GenericXLog (для WAL-записи)
- *   7. Освобождает буфер
+ * Генерирует случайный 128-битный IV и шифрует всё после t_hoff
+ * шифром «Кузнечик» CTR.  Кортеж модифицируется на месте — вызывающая
+ * сторона должна передать записываемую (writable) копию.
  *
- * row_iv_out — выходной буфер для сгенерированного IV (DATA_IV_SIZE байт).
+ * ВАЖНО: вызывается ДО heap_insert / heap_update / heap_multi_insert,
+ * чтобы в WAL-журнал попадали уже зашифрованные данные.
+ *
+ * iv_out — выходной буфер для IV (DATA_IV_SIZE байт).
  * Возвращает длину зашифрованного payload (0 если нечего шифровать).
- *
- * ВАЖНО: должна вызываться сразу после heap_insert/heap_update,
- * пока страница ещё в shared_buffers и не видна другим бэкендам.
  */
 int
-opentde_encrypt_in_buffer(Relation relation, Oid table_oid,
-                          const ItemPointer tid, uint8_t *row_iv_out)
+opentde_encrypt_tuple_inplace(HeapTuple tuple, Oid table_oid,
+                              uint8_t *iv_out)
 {
-    Buffer              buf;
-    Page                page;
-    OffsetNumber        offnum;
-    ItemId              itemid;
-    HeapTupleHeader     htup;
-    char               *payload;
-    int                 payload_len;
-    GenericXLogState   *xlog_state;
+    char *payload;
+    int   payload_len;
 
-    offnum = ItemPointerGetOffsetNumber(tid);
-    buf    = ReadBuffer(relation, ItemPointerGetBlockNumber(tid));
-    LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+    payload     = (char *) tuple->t_data + tuple->t_data->t_hoff;
+    payload_len = tuple->t_len - tuple->t_data->t_hoff;
 
-    /* Регистрация буфера для WAL-журнала через GenericXLog */
-    xlog_state = GenericXLogStart(relation);
-    page       = GenericXLogRegisterBuffer(xlog_state, buf, 0);
+    if (payload_len <= 0)
+        return 0;
 
-    /* Нахождение кортежа на странице по смещению */
-    itemid      = PageGetItemId(page, offnum);
-    htup        = (HeapTupleHeader) PageGetItem(page, itemid);
-    payload_len = (int) ItemIdGetLength(itemid) - htup->t_hoff;
-    payload     = (char *) htup + htup->t_hoff;
+    opentde_fill_random_bytes(iv_out, DATA_IV_SIZE, "tuple payload IV");
+    opentde_gost_encrypt_decrypt(payload, payload_len, table_oid, iv_out);
 
-    if (payload_len > 0)
-    {
-        elog(LOG, "[OpenTDE] ENC tid=(%u,%u) hoff=%u ilen=%u plain[0..3]=[%02x %02x %02x %02x]",
-             (unsigned) ItemPointerGetBlockNumber(tid),
-             (unsigned) ItemPointerGetOffsetNumber(tid),
-             (unsigned) htup->t_hoff,
-             (unsigned) ItemIdGetLength(itemid),
-             (unsigned char) payload[0], (unsigned char) payload[1],
-             (unsigned char) payload[2], (unsigned char) payload[3]);
-
-        /* Генерация случайного IV и шифрование payload */
-        opentde_fill_random_bytes(row_iv_out, DATA_IV_SIZE,
-                                  "tuple payload IV");
-        opentde_gost_encrypt_decrypt(payload, payload_len, table_oid,
-                                     row_iv_out);
-
-        elog(LOG, "[OpenTDE] ENC tid=(%u,%u) ciph[0..3]=[%02x %02x %02x %02x]",
-             (unsigned) ItemPointerGetBlockNumber(tid),
-             (unsigned) ItemPointerGetOffsetNumber(tid),
-             (unsigned char) payload[0], (unsigned char) payload[1],
-             (unsigned char) payload[2], (unsigned char) payload[3]);
-
-        GenericXLogFinish(xlog_state);
-    }
-    else
-    {
-        GenericXLogAbort(xlog_state);
-    }
-
-    UnlockReleaseBuffer(buf);
     return payload_len;
 }

@@ -207,8 +207,8 @@ uint8_t *opentde_get_table_dek(Oid table_oid);
 void opentde_gost_encrypt_decrypt(char *data, int len, Oid table_oid,
                                   const uint8_t *iv);
 
-/* Шифрование payload кортежа непосредственно в буферной странице */
-int opentde_encrypt_in_buffer(Relation relation, Oid table_oid,
-                              const ItemPointer tid, uint8_t *row_iv_out);
+/* Шифрование payload кортежа в памяти (in-place, до вызова heap_insert) */
+int opentde_encrypt_tuple_inplace(HeapTuple tuple, Oid table_oid,
+                                  uint8_t *iv_out);
 
 #endif /* OPENTDE_H */
