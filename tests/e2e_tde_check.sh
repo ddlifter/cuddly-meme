@@ -176,7 +176,51 @@ echo "  ✓ ENCRYPTED: hex-паттерн отсутствует"
 echo ""
 
 echo ""
-echo "  [5/8] Слепой индекс и Index Scan"
+echo "  [5/8] Проверка WAL"
+echo ""
+echo ""
+sql -c "DELETE FROM t_test WHERE name='WAL_ENC_000001';"
+sql -c "INSERT INTO t_test VALUES (9001,'WAL_ENC_000001');"
+sql -c "CHECKPOINT;"
+sql -c "SELECT pg_switch_wal();"
+
+sql -c "DELETE FROM t_plain WHERE name='WAL_PLAIN_20260320';"
+sql -c "INSERT INTO t_plain VALUES (9101,'WAL_PLAIN_20260320');"
+sql -c "CHECKPOINT;"
+sql -c "SELECT pg_switch_wal();"
+
+ENC_GREP_OUT=$(mktemp)
+PLAIN_GREP_OUT=$(mktemp)
+
+echo "  grep WAL_ENC_000001:"
+if grep -aob "WAL_ENC_000001" "$PGDATA"/pg_wal/0* >"$ENC_GREP_OUT" 2>/dev/null; then
+  sed 's/^/    /' "$ENC_GREP_OUT"
+  rm -f "$ENC_GREP_OUT" "$PLAIN_GREP_OUT"
+  fail "В WAL найден plaintext-маркер WAL_ENC_000001 для зашифрованной таблицы"
+else
+  echo "    (no matches)"
+  echo "  ✓ WAL_ENC_000001 не найден в WAL"
+fi
+
+echo ""
+echo "  grep WAL_PLAIN_20260320:"
+if grep -aob "WAL_PLAIN_20260320" "$PGDATA"/pg_wal/0* >"$PLAIN_GREP_OUT" 2>/dev/null; then
+  sed 's/^/    /' "$PLAIN_GREP_OUT"
+  echo "  ✓ WAL_PLAIN_20260320 найден в WAL"
+else
+  echo "    (no matches)"
+  rm -f "$ENC_GREP_OUT" "$PLAIN_GREP_OUT"
+  fail "В WAL не найден plaintext-маркер WAL_PLAIN_20260320 для обычной таблицы"
+fi
+
+rm -f "$ENC_GREP_OUT" "$PLAIN_GREP_OUT"
+
+sql -c "DELETE FROM t_test WHERE name='WAL_ENC_000001';"
+sql -c "DELETE FROM t_plain WHERE name='WAL_PLAIN_20260320';"
+echo ""
+
+echo ""
+echo "  [6/8] Слепой индекс и Index Scan"
 echo ""
 echo ""
 sql -c "CREATE INDEX idx_blind ON t_test (opentde_blind_index(name));"
@@ -196,7 +240,7 @@ echo "  ✓ Найденная строка: $FOUND"
 echo ""
 
 echo ""
-echo "  [6/8] Данные читаются после рестарта"
+echo "  [7/8] Данные читаются после рестарта"
 echo ""
 echo ""
 DEK_BEFORE=$(sql_val "SELECT opentde_get_dek_hex('t_test'::regclass::oid)")
@@ -221,7 +265,7 @@ sql_show "SELECT id, name FROM t_test ORDER BY id;"
 echo ""
 
 echo ""
-echo "  [7/7] Восстановление после краша сервера"
+echo "  [8/8] Восстановление после краша сервера"
 echo ""
 echo ""
 echo "  Убиваю процесс сервера (kill -9)..."

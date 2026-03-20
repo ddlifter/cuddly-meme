@@ -30,11 +30,25 @@ SELECT pg_relation_filepath('t_test'::regclass);
 SELECT pg_relation_filepath('t_plain'::regclass);
 
 
-CREATE INDEX idx_blind ON t_test (opentde_blind_index(name));
-
-SET enable_seqscan=off; EXPLAIN (COSTS OFF) SELECT * FROM t_test WHERE opentde_blind_index(name) = opentde_blind_index('Привет мир');
-SET enable_seqscan=off; SELECT name FROM t_test WHERE opentde_blind_index(name) = opentde_blind_index('Привет мир');
 
 SELECT opentde_get_dek_hex('t_test'::regclass::oid);
 
 
+DELETE FROM t_test WHERE name='WAL_ENC_000001';
+INSERT INTO t_test VALUES (9001,'WAL_ENC_000001');
+CHECKPOINT;
+SELECT pg_switch_wal();
+
+DELETE FROM t_plain WHERE name='WAL_PLAIN_20260320';
+INSERT INTO t_plain VALUES (9101,'WAL_PLAIN_20260320');
+CHECKPOINT;
+SELECT pg_switch_wal();
+
+grep -aob "WAL_ENC_000001" /home/ddlifter/pg_data/pg_wal/0*
+grep -aob "WAL_PLAIN_20260320" /home/ddlifter/pg_data/pg_wal/0*
+
+
+CREATE INDEX idx_blind ON t_test (opentde_blind_index(name));
+
+SET enable_seqscan=off; EXPLAIN (COSTS OFF) SELECT * FROM t_test WHERE opentde_blind_index(name) = opentde_blind_index('Привет мир');
+SET enable_seqscan=off; SELECT name FROM t_test WHERE opentde_blind_index(name) = opentde_blind_index('Привет мир');
