@@ -4,6 +4,8 @@
  * Содержит функции, вызываемые пользователем через SQL:
  *
  *   opentde_set_master_key(bytea) — установка мастер-ключа шифрования
+ *   opentde_rotate_master_key(bytea) — ротация мастер-ключа (rewrap DEK)
+ *   opentde_rotate_table_dek(oid) — ротация DEK конкретной таблицы
  *   opentde_debug_keys()          — вывод всех DEK (для отладки)
  *   opentde_get_dek_hex(oid)      — получение DEK таблицы в HEX
  *   opentde_blind_index(text)     — слепой индекс (HMAC-SHA256)
@@ -17,6 +19,8 @@
 
 /* Регистрация SQL-функций в PostgreSQL */
 PG_FUNCTION_INFO_V1(opentde_set_master_key);
+PG_FUNCTION_INFO_V1(opentde_rotate_master_key);
+PG_FUNCTION_INFO_V1(opentde_rotate_table_dek_sql);
 PG_FUNCTION_INFO_V1(opentde_debug_keys);
 PG_FUNCTION_INFO_V1(opentde_get_dek_hex);
 PG_FUNCTION_INFO_V1(opentde_blind_index);
@@ -39,10 +43,12 @@ Datum
 opentde_set_master_key(PG_FUNCTION_ARGS)
 {
     bytea *key_data;
+    uint8_t *new_key;
     int    key_len;
 
     key_data = PG_GETARG_BYTEA_P(0);
     key_len  = VARSIZE_ANY_EXHDR(key_data);
+    new_key  = (uint8_t *) VARDATA_ANY(key_data);
 
     /* Проверка длины: ровно 32 байта (256 бит) */
     if (key_len != MASTER_KEY_SIZE)
@@ -54,7 +60,8 @@ opentde_set_master_key(PG_FUNCTION_ARGS)
     }
 
     opentde_init_key_manager();
-    memcpy(global_key_mgr->master_key, key_data + VARHDRSZ, MASTER_KEY_SIZE);
+
+    memcpy(global_key_mgr->master_key, new_key, MASTER_KEY_SIZE);
     master_key_set = true;
 
     /* Сохранение ключа и загрузка существующих DEK/IV */
@@ -66,6 +73,100 @@ opentde_set_master_key(PG_FUNCTION_ARGS)
          "[OpenTDE] Master key set and %d keys loaded+decrypted",
          global_key_mgr->key_count);
     PG_RETURN_VOID();
+}
+
+/* =====================================================================
+ * opentde_rotate_master_key(bytea) → int4
+ *
+ * Быстрая ротация мастер-ключа без перешифрования пользовательских данных.
+ *
+ * Что делает:
+ *   1) проверяет новый ключ (32 байта)
+ *   2) загружает DEK в память (если ещё не загружены)
+ *   3) заменяет мастер-ключ в памяти
+ *   4) заново оборачивает все DEK новым мастер-ключом и сохраняет keys
+ *   5) сохраняет новый мастер-ключ в pg_encryption/master.key
+ *
+ * Возвращает количество переобёрнутых DEK.
+ * ===================================================================== */
+Datum
+opentde_rotate_master_key(PG_FUNCTION_ARGS)
+{
+    bytea    *key_data;
+    uint8_t  *new_key;
+    int       key_len;
+
+    key_data = PG_GETARG_BYTEA_P(0);
+    key_len  = VARSIZE_ANY_EXHDR(key_data);
+    new_key  = (uint8_t *) VARDATA_ANY(key_data);
+
+    if (key_len != MASTER_KEY_SIZE)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("master key must be exactly %d bytes", MASTER_KEY_SIZE)));
+    }
+
+    opentde_init_key_manager();
+
+    if (!master_key_set)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("master key is not set"),
+                 errhint("Call opentde_set_master_key() first.")));
+    }
+
+    if (global_key_mgr->key_count == 0)
+        opentde_load_key_file();
+
+    if (memcmp(global_key_mgr->master_key, new_key, MASTER_KEY_SIZE) == 0)
+        PG_RETURN_INT32(global_key_mgr->key_count);
+
+    memcpy(global_key_mgr->master_key, new_key, MASTER_KEY_SIZE);
+
+    /* Быстрая ротация: re-wrap DEK новым мастер-ключом. */
+    opentde_save_key_file();
+    opentde_save_master_key_to_file();
+
+    ereport(WARNING,
+            (errmsg("blind index values depend on master key"),
+             errhint("Rebuild indexes created with opentde_blind_index() after rotation.")));
+
+    PG_RETURN_INT32(global_key_mgr->key_count);
+}
+
+/* =====================================================================
+ * opentde_rotate_table_dek(oid) → int4
+ *
+ * Создаёт новую активную версию DEK для указанной таблицы.
+ * Старые версии остаются для чтения ранее зашифрованных строк.
+ *
+ * Возвращает новую версию DEK.
+ * ===================================================================== */
+Datum
+opentde_rotate_table_dek_sql(PG_FUNCTION_ARGS)
+{
+    Oid      table_oid;
+    uint32_t new_version;
+
+    table_oid = PG_GETARG_OID(0);
+
+    opentde_init_key_manager();
+
+    if (!master_key_set)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("master key is not set"),
+                 errhint("Call opentde_set_master_key() first.")));
+    }
+
+    if (global_key_mgr->key_count == 0)
+        opentde_load_key_file();
+
+    new_version = opentde_rotate_table_dek(table_oid);
+    PG_RETURN_INT32((int32) new_version);
 }
 
 /* =====================================================================

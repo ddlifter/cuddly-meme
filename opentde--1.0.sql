@@ -7,6 +7,16 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'opentde_set_master_key'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION opentde_rotate_master_key(bytea)
+RETURNS int4
+AS 'MODULE_PATHNAME', 'opentde_rotate_master_key'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION opentde_rotate_table_dek(oid)
+RETURNS int4
+AS 'MODULE_PATHNAME', 'opentde_rotate_table_dek_sql'
+LANGUAGE C STRICT;
+
 CREATE FUNCTION opentde_tableam_handler(internal)
 RETURNS table_am_handler
 AS 'MODULE_PATHNAME', 'opentde_tableam_handler'

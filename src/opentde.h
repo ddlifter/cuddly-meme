@@ -46,8 +46,11 @@
 #define IV_FILE_MAGIC   0x4F544956   /* ASCII "OTIV" */
 
 /* Версии форматов файлов */
-#define KEY_VERSION     2
-#define IV_VERSION      1
+#define KEY_VERSION     3
+#define IV_VERSION      2
+
+/* Начальная версия DEK для таблицы */
+#define DEFAULT_DEK_VERSION 1
 
 /* Размеры криптографических параметров (в байтах) */
 #define MASTER_KEY_SIZE   32                           /* Мастер-ключ: 256 бит */
@@ -81,6 +84,9 @@ typedef struct {
  */
 typedef struct {
     Oid      table_oid;                      /* OID таблицы */
+    uint32_t key_version;                    /* Версия DEK таблицы */
+    uint8_t  is_active;                      /* 1 = активная версия для новых записей */
+    uint8_t  pad[3];                         /* Выравнивание */
     uint8_t  wrapped_dek[WRAPPED_DEK_SIZE];  /* IV (16 байт) + зашифрованный DEK (32 байта) */
     uint64_t created_at;                     /* Время создания (UNIX timestamp) */
 } key_file_entry;
@@ -106,6 +112,7 @@ typedef struct {
     BlockNumber  block;            /* Номер блока (страницы) */
     OffsetNumber offset;           /* Смещение внутри блока */
     uint16_t     pad;              /* Выравнивание */
+    uint32_t     key_version;      /* Версия DEK, которой зашифрован payload */
     uint8_t      iv[DATA_IV_SIZE]; /* Вектор инициализации (16 байт) */
     uint64_t     created_at;       /* Время создания */
 } iv_file_entry;
@@ -121,6 +128,8 @@ typedef struct {
     uint8_t dek[DEK_SIZE];                   /* Расшифрованный ключ таблицы */
     uint8_t wrapped_dek[WRAPPED_DEK_SIZE];   /* Обёрнутая копия (для записи в файл) */
     Oid     table_oid;                       /* OID таблицы */
+    uint32_t key_version;                    /* Версия DEK таблицы */
+    bool     is_active;                      /* true = активный DEK для новых записей */
 } opentde_key_entry;
 
 /*
@@ -130,6 +139,7 @@ typedef struct {
     Oid          table_oid;
     BlockNumber  block;
     OffsetNumber offset;
+    uint32_t     key_version;
     uint8_t      iv[DATA_IV_SIZE];
 } opentde_iv_entry;
 
@@ -180,9 +190,9 @@ void opentde_save_master_key_to_file(void);
 
 /* Регистрация и поиск IV для кортежа */
 void opentde_register_tuple_iv(Oid table_oid, const ItemPointer tid,
-                               const uint8_t *iv);
+                                                             const uint8_t *iv, uint32_t key_version);
 bool opentde_lookup_tuple_iv(Oid table_oid, const ItemPointer tid,
-                             uint8_t *iv_out);
+                                                         uint8_t *iv_out, uint32_t *key_version_out);
 
 /* =====================================================================
  * Прототипы — opentde_crypto.c
@@ -202,13 +212,17 @@ bool opentde_unwrap_dek(const uint8_t *master_key, const uint8_t *wrapped_dek,
 
 /* Получение DEK для таблицы (создаёт новый, если не существует) */
 uint8_t *opentde_get_table_dek(Oid table_oid);
+uint8_t *opentde_get_table_dek_by_version(Oid table_oid, uint32_t key_version);
+uint32_t opentde_get_active_table_key_version(Oid table_oid);
+uint32_t opentde_rotate_table_dek(Oid table_oid);
 
 /* Шифрование / дешифрование данных шифром «Кузнечик» в режиме CTR */
 void opentde_gost_encrypt_decrypt(char *data, int len, Oid table_oid,
-                                  const uint8_t *iv);
+                                  uint32_t key_version, const uint8_t *iv);
 
 /* Шифрование payload кортежа в памяти (in-place, до вызова heap_insert) */
 int opentde_encrypt_tuple_inplace(HeapTuple tuple, Oid table_oid,
-                                  uint8_t *iv_out);
+                                  uint8_t *iv_out,
+                                  uint32_t *key_version_out);
 
 #endif /* OPENTDE_H */

@@ -48,7 +48,7 @@ echo ""
 
 # ===========================================================================
 echo ""
-echo "  [1/8] Установка расширения и создание таблиц"
+echo "  [1/9] Установка расширения и создание таблиц"
 echo ""
 echo ""
 sql <<SQL
@@ -91,7 +91,7 @@ sql_show "SELECT id, name FROM t_test ORDER BY id;"
 echo ""
 
 echo ""
-echo "  [2/8] UPDATE — Обновляем колонку"
+echo "  [2/9] UPDATE — Обновляем колонку"
 echo ""
 echo ""
 sql -c "UPDATE t_test SET name = 'Обновлённая' WHERE id = 2;"
@@ -114,7 +114,7 @@ sql_show "SELECT id, name FROM t_test ORDER BY id;"
 echo ""
 
 echo ""
-echo "  [3/8] COPY (массовая вставка)"
+echo "  [3/9] COPY (массовая вставка)"
 echo ""
 echo ""
 printf '4\tСтрока из COPY\n5\tЕщё одна строка\n' \
@@ -132,7 +132,39 @@ sql_show "SELECT id, name FROM t_test ORDER BY id;"
 echo ""
 
 echo ""
-echo "  [4/8] Сравнение файлов: обычная vs зашифрованная таблица"
+echo "  [4/9] Ротация DEK и чтение смешанных данных"
+echo ""
+echo ""
+DEK_BEFORE_ROT=$(sql_val "SELECT opentde_get_dek_hex('t_test'::regclass::oid)")
+ROTATED_VER=$(sql_val "SELECT opentde_rotate_table_dek('t_test'::regclass::oid)")
+DEK_AFTER_ROT=$(sql_val "SELECT opentde_get_dek_hex('t_test'::regclass::oid)")
+
+[[ "$ROTATED_VER" -ge 2 ]] || fail "Ожидалась версия DEK >= 2 после ротации, получено $ROTATED_VER"
+[[ "$DEK_BEFORE_ROT" != "$DEK_AFTER_ROT" ]] || fail "DEK не изменился после ротации"
+
+sql -c "INSERT INTO t_test VALUES (6, 'После ротации DEK');"
+
+OLD_VAL=$(sql_val "SELECT name FROM t_test WHERE id = 1")
+[[ "$OLD_VAL" == "Привет мир" ]] || fail "Старая строка после ротации читается неверно: '$OLD_VAL'"
+
+NEW_VAL=$(sql_val "SELECT name FROM t_test WHERE id = 6")
+[[ "$NEW_VAL" == "После ротации DEK" ]] || fail "Новая строка после ротации читается неверно: '$NEW_VAL'"
+
+CNT=$(sql_val "SELECT count(*) FROM t_test")
+[[ "$CNT" -eq 6 ]] || fail "После ротации ожидалось 6 строк, получено $CNT"
+
+echo "  DEK before rotation: $DEK_BEFORE_ROT"
+echo "  DEK after rotation:  $DEK_AFTER_ROT"
+echo "  New DEK version:     $ROTATED_VER"
+echo ""
+echo "  ✓ Старые и новые строки читаются"
+echo ""
+echo "  Данные после ротации DEK:"
+sql_show "SELECT id, name FROM t_test ORDER BY id;"
+echo ""
+
+echo ""
+echo "  [5/9] Сравнение файлов: обычная vs зашифрованная таблица"
 echo ""
 echo ""
 sql -c "CHECKPOINT;"
@@ -176,7 +208,7 @@ echo "  ✓ ENCRYPTED: hex-паттерн отсутствует"
 echo ""
 
 echo ""
-echo "  [5/8] Проверка WAL"
+echo "  [6/9] Проверка WAL"
 echo ""
 echo ""
 sql -c "DELETE FROM t_test WHERE name='WAL_ENC_000001';"
@@ -220,7 +252,7 @@ sql -c "DELETE FROM t_plain WHERE name='WAL_PLAIN_20260320';"
 echo ""
 
 echo ""
-echo "  [6/8] Слепой индекс и Index Scan"
+echo "  [7/9] Слепой индекс и Index Scan"
 echo ""
 echo ""
 sql -c "CREATE INDEX idx_blind ON t_test (opentde_blind_index(name));"
@@ -240,7 +272,7 @@ echo "  ✓ Найденная строка: $FOUND"
 echo ""
 
 echo ""
-echo "  [7/8] Данные читаются после рестарта"
+echo "  [8/9] Данные читаются после рестарта"
 echo ""
 echo ""
 DEK_BEFORE=$(sql_val "SELECT opentde_get_dek_hex('t_test'::regclass::oid)")
@@ -251,7 +283,7 @@ restart
 echo ""
 
 CNT=$(sql_val "SELECT count(*) FROM t_test")
-[[ "$CNT" -eq 5 ]] || fail "После рестарта ожидалось 5 строк, получено $CNT"
+[[ "$CNT" -eq 6 ]] || fail "После рестарта ожидалось 6 строк, получено $CNT"
 
 DEK_AFTER=$(sql_val "SELECT opentde_get_dek_hex('t_test'::regclass::oid)")
 [[ "$DEK_BEFORE" == "$DEK_AFTER" ]] || fail "DEK изменился после рестарта"
@@ -265,7 +297,7 @@ sql_show "SELECT id, name FROM t_test ORDER BY id;"
 echo ""
 
 echo ""
-echo "  [8/8] Восстановление после краша сервера"
+echo "  [9/9] Восстановление после краша сервера"
 echo ""
 echo ""
 echo "  Убиваю процесс сервера (kill -9)..."

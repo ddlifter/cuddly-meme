@@ -103,6 +103,7 @@ opentde_decrypt_slot(Oid table_oid, TupleTableSlot *slot)
     char           *payload;
     int             payload_len;
     uint8_t         row_iv[DATA_IV_SIZE];
+    uint32_t        row_key_version = 0;
     ItemPointerData saved_tid;
 
     saved_tid = slot->tts_tid;
@@ -120,7 +121,8 @@ opentde_decrypt_slot(Oid table_oid, TupleTableSlot *slot)
 
     if (payload_len > 0)
     {
-        if (!opentde_lookup_tuple_iv(table_oid, &decrypted->t_self, row_iv))
+        if (!opentde_lookup_tuple_iv(table_oid, &decrypted->t_self,
+                         row_iv, &row_key_version))
             ereport(ERROR,
                     (errcode(ERRCODE_INTERNAL_ERROR),
                      errmsg("missing tuple IV for table %u block %u offset %u",
@@ -128,7 +130,8 @@ opentde_decrypt_slot(Oid table_oid, TupleTableSlot *slot)
                             ItemPointerGetBlockNumber(&decrypted->t_self),
                             ItemPointerGetOffsetNumber(&decrypted->t_self))));
 
-        opentde_gost_encrypt_decrypt(payload, payload_len, table_oid, row_iv);
+        opentde_gost_encrypt_decrypt(payload, payload_len,
+                         table_oid, row_key_version, row_iv);
     }
 
     ExecForceStoreHeapTuple(decrypted, slot, true);
@@ -158,6 +161,7 @@ opentde_tuple_insert(Relation relation,
     HeapTuple tuple;
     Oid       table_oid;
     uint8_t   row_iv[DATA_IV_SIZE];
+    uint32_t  row_key_version = 0;
     int       payload_len;
 
     table_oid = RelationGetRelid(relation);
@@ -171,7 +175,8 @@ opentde_tuple_insert(Relation relation,
      * heap_insert запишет зашифрованный кортеж и на страницу,
      * и в WAL-журнал.
      */
-    payload_len = opentde_encrypt_tuple_inplace(tuple, table_oid, row_iv);
+    payload_len = opentde_encrypt_tuple_inplace(tuple, table_oid,
+                                                row_iv, &row_key_version);
 
     heap_insert(relation, tuple, cid, options, bistate);
 
@@ -182,7 +187,8 @@ opentde_tuple_insert(Relation relation,
 
     /* Регистрируем IV для полученного TID */
     if (payload_len > 0)
-        opentde_register_tuple_iv(table_oid, &tuple->t_self, row_iv);
+        opentde_register_tuple_iv(table_oid, &tuple->t_self,
+                                  row_iv, row_key_version);
 
     slot->tts_tid = tuple->t_self;
 
@@ -213,6 +219,7 @@ opentde_tuple_update(Relation relation,
     HeapTuple  tuple;
     Oid        table_oid;
     uint8_t    row_iv[DATA_IV_SIZE];
+    uint32_t   row_key_version = 0;
     TM_Result  result;
     int        payload_len;
 
@@ -228,7 +235,8 @@ opentde_tuple_update(Relation relation,
     /*
      * Шифруем payload ДО heap_update — WAL получит зашифрованные данные.
      */
-    payload_len = opentde_encrypt_tuple_inplace(tuple, table_oid, row_iv);
+    payload_len = opentde_encrypt_tuple_inplace(tuple, table_oid,
+                                                row_iv, &row_key_version);
 
     result = heap_update(relation, otid, tuple, cid, crosscheck, wait,
                          tmfd, lockmode, update_indexes);
@@ -236,7 +244,8 @@ opentde_tuple_update(Relation relation,
     ItemPointerCopy(&tuple->t_self, &slot->tts_tid);
 
     if (result == TM_Ok && payload_len > 0)
-        opentde_register_tuple_iv(table_oid, &tuple->t_self, row_iv);
+        opentde_register_tuple_iv(table_oid, &tuple->t_self,
+                                  row_iv, row_key_version);
 
     if (should_free)
         heap_freetuple(tuple);
@@ -261,11 +270,13 @@ opentde_multi_insert(Relation relation,
     Oid      table_oid;
     int      i;
     uint8_t (*ivs)[DATA_IV_SIZE];
+    uint32_t *key_versions;
 
     table_oid = RelationGetRelid(relation);
 
     /* Массив IV — по одному на каждый кортеж */
     ivs = palloc(nslots * sizeof(*ivs));
+    key_versions = palloc0(nslots * sizeof(*key_versions));
 
     /*
      * Шифруем каждый кортеж ДО массовой вставки.
@@ -282,11 +293,13 @@ opentde_multi_insert(Relation relation,
         if (!tuple)
         {
             memset(ivs[i], 0, DATA_IV_SIZE);
+            key_versions[i] = 0;
             continue;
         }
 
         encrypted = heap_copytuple(tuple);
-        opentde_encrypt_tuple_inplace(encrypted, table_oid, ivs[i]);
+        opentde_encrypt_tuple_inplace(encrypted, table_oid,
+                                      ivs[i], &key_versions[i]);
         ExecForceStoreHeapTuple(encrypted, slots[i], true);
 
         if (should_free)
@@ -299,10 +312,12 @@ opentde_multi_insert(Relation relation,
     /* Регистрация IV для каждого назначенного TID */
     for (i = 0; i < nslots; i++)
     {
-        if (ItemPointerIsValid(&slots[i]->tts_tid))
-            opentde_register_tuple_iv(table_oid, &slots[i]->tts_tid, ivs[i]);
+        if (ItemPointerIsValid(&slots[i]->tts_tid) && key_versions[i] != 0)
+            opentde_register_tuple_iv(table_oid, &slots[i]->tts_tid,
+                                      ivs[i], key_versions[i]);
     }
 
+    pfree(key_versions);
     pfree(ivs);
 }
 
