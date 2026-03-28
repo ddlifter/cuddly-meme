@@ -122,7 +122,6 @@ opentde_set_master_key(PG_FUNCTION_ARGS)
     /* Сохранение ключа и загрузка существующих DEK/IV */
     opentde_save_master_key_to_file();
     opentde_load_key_file();
-    opentde_load_iv_file();
 
     elog(DEBUG1,
          "[OpenTDE] Master key set and %d keys loaded+decrypted",

@@ -5,6 +5,8 @@
 *.bc
 *.d
 
+tests/vault_env.sh
+
 /src/*.bc
 
 results/

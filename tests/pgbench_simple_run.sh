@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(dirname "$0")/vault_env.sh"
 set -euo pipefail
 
 DBNAME="${1:-postgres}"
@@ -16,16 +17,22 @@ echo "[simple] setup..."
 "$PSQL" -d "$DBNAME" -v ON_ERROR_STOP=1 -f "$SCRIPT_DIR/pgbench_simple_setup.sql"
 
 echo "[simple] plain..."
-PLAIN=$(
-  "$PGBENCH" -n -d "$DBNAME" -c "$CLIENTS" -j "$THREADS" -T "$DURATION" \
-    -f "$SCRIPT_DIR/pgbench_simple_plain.sql" 2>&1 | grep -E "latency average|tps =" || true
-)
+
+echo "[simple] plain: running pgbench..."
+PLAIN_RAW=$("$PGBENCH" -n -d "$DBNAME" -c "$CLIENTS" -j "$THREADS" -T "$DURATION" \
+    -f "$SCRIPT_DIR/pgbench_simple_plain.sql" 2>&1 || true)
+echo "[simple] plain: raw output:"
+echo "$PLAIN_RAW"
+PLAIN=$(echo "$PLAIN_RAW" | grep -E "latency average|tps =|ERROR:|FATAL:|Run was aborted" || true)
 
 echo "[simple] encrypted..."
-ENCRYPTED=$(
-  "$PGBENCH" -n -d "$DBNAME" -c "$CLIENTS" -j "$THREADS" -T "$DURATION" \
-    -f "$SCRIPT_DIR/pgbench_simple_encrypted.sql" 2>&1 | grep -E "latency average|tps =|ERROR:|FATAL:|Run was aborted" || true
-)
+
+echo "[simple] encrypted: running pgbench..."
+ENCRYPTED_RAW=$("$PGBENCH" -n -d "$DBNAME" -c "$CLIENTS" -j "$THREADS" -T "$DURATION" \
+    -f "$SCRIPT_DIR/pgbench_simple_encrypted.sql" 2>&1 || true)
+echo "[simple] encrypted: raw output:"
+echo "$ENCRYPTED_RAW"
+ENCRYPTED=$(echo "$ENCRYPTED_RAW" | grep -E "latency average|tps =|ERROR:|FATAL:|Run was aborted" || true)
 
 echo ""
 echo "===== SIMPLE RESULT ====="

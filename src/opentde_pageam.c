@@ -91,7 +91,10 @@ static void opentde_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId c
     if (!TTS_EMPTY(slot)) {
         /* Get HeapTuple from slot */
         HeapTuple tuple = ExecCopySlotHeapTuple(slot);
-        opentde_pagestore_append_tuple(RelationGetRelid(rel), tuple, NULL);
+        /* Инициализируем t_self валидным значением (blockno=0, offset=1) */
+        ItemPointerSet(&tuple->t_self, 0, 1);
+        ItemPointerData tid;
+        opentde_pagestore_append_tuple(RelationGetRelid(rel), tuple, &tid);
         heap_freetuple(tuple);
     }
 }

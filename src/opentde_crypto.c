@@ -387,35 +387,3 @@ opentde_gost_encrypt_decrypt(char *data, int len, Oid table_oid,
     kuz_ctr_crypt_ctx(kuz_ctx, iv, (uint8_t *) data, (size_t) len);
 }
 
-/*
- * Шифрование payload кортежа в памяти
- */
-int
-opentde_encrypt_tuple_inplace(HeapTuple tuple, Oid table_oid,
-                              uint8_t *iv_out,
-                              uint32_t *key_version_out)
-{
-    char     *payload;
-    int       payload_len;
-    uint32_t  key_version;
-
-    payload     = (char *) tuple->t_data + tuple->t_data->t_hoff;
-    payload_len = tuple->t_len - tuple->t_data->t_hoff;
-
-    if (payload_len <= 0)
-    {
-        if (key_version_out)
-            *key_version_out = 0;
-        return 0;
-    }
-
-    key_version = opentde_get_active_table_key_version(table_oid);
-
-    opentde_fill_random_bytes(iv_out, DATA_IV_SIZE, "tuple payload IV");
-    opentde_gost_encrypt_decrypt(payload, payload_len, table_oid, key_version, iv_out);
-
-    if (key_version_out)
-        *key_version_out = key_version;
-
-    return payload_len;
-}

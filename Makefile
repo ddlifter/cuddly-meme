@@ -12,9 +12,9 @@ PG_CONFIG = /home/ddlifter/diploma/pg_build/bin/pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
-# Линкуем с OpenSSL для криптографии
-# Убедись, что стоит пакет libssl-dev
-SHLIB_LINK += -lssl -lcrypto
+# Линкуем с OpenSSL и libcurl для криптографии и HTTP
+# Убедись, что стоят пакеты libssl-dev и libcurl4-openssl-dev
+SHLIB_LINK += -lssl -lcrypto -lcurl
 
 # Для бенчмарков явно включаем оптимизацию расширения,
 # даже если сам PostgreSQL собран с debug-флагами.

@@ -138,19 +138,17 @@ static int opentde_page_blob_encrypt(Oid table_oid, BlockNumber blockno, uint8_t
         elog(LOG, "OpenTDE: page_blob_encrypt: invalid input, returning 0");
         return 0;
     }
-    /* Получаем DEK и генерируем IV */
+    /* Получаем DEK и IV для страницы (offset=0) */
     uint8_t *dek = opentde_get_table_dek(table_oid);
     uint8_t iv[DATA_IV_SIZE];
-    opentde_fill_random_bytes(iv, DATA_IV_SIZE, "pagestore_encrypt");
+    uint32_t key_version = DEFAULT_DEK_VERSION;
+    memset(iv, 0, DATA_IV_SIZE);
+    memcpy(iv, &blockno, sizeof(blockno));
     *blob_out = (uint8_t *) palloc(plain_len);
     memcpy(*blob_out, plain, plain_len);
-    opentde_gost_encrypt_decrypt((char *)*blob_out, plain_len, table_oid, DEFAULT_DEK_VERSION, iv);
+    opentde_gost_encrypt_decrypt((char *)*blob_out, plain_len, table_oid, key_version, iv);
     *blob_len_out = plain_len;
-    /* Сохраняем IV для этого блока (или tuple) */
-    ItemPointerData fake_tid;
-    ItemPointerSet(&fake_tid, blockno, 1); /* offset=1: для page-level, иначе нужен tid */
-    opentde_register_tuple_iv(table_oid, &fake_tid, iv, DEFAULT_DEK_VERSION);
-    elog(LOG, "OpenTDE: page_blob_encrypt: encrypted %u bytes", plain_len);
+    elog(LOG, "OpenTDE: page_blob_encrypt: encrypted %u bytes (page-level)", plain_len);
     return 1;
 }
 static int opentde_page_blob_decrypt(Oid table_oid, BlockNumber blockno, uint8_t *blob, uint32_t blob_len, uint8_t **plain_out, uint32_t *plain_len_out, void *unused)
@@ -159,16 +157,12 @@ static int opentde_page_blob_decrypt(Oid table_oid, BlockNumber blockno, uint8_t
         return 0;
     *plain_out = (uint8_t *) palloc(blob_len);
     memcpy(*plain_out, blob, blob_len);
-    /* Получаем DEK и IV */
+    /* Получаем DEK и IV для страницы (offset=0) */
     uint8_t *dek = opentde_get_table_dek(table_oid);
     uint8_t iv[DATA_IV_SIZE];
     uint32_t key_version = DEFAULT_DEK_VERSION;
-    ItemPointerData fake_tid;
-    ItemPointerSet(&fake_tid, blockno, 1);
-    if (!opentde_lookup_tuple_iv(table_oid, &fake_tid, iv, &key_version)) {
-        elog(WARNING, "OpenTDE: page_blob_decrypt: IV not found for table_oid=%u blockno=%u", table_oid, blockno);
-        memset(iv, 0, DATA_IV_SIZE);
-    }
+    memset(iv, 0, DATA_IV_SIZE);
+    memcpy(iv, &blockno, sizeof(blockno));
     opentde_gost_encrypt_decrypt((char *)*plain_out, blob_len, table_oid, key_version, iv);
     *plain_len_out = blob_len;
     return 1;
@@ -241,7 +235,6 @@ opentde_pagestore_append_tuple_internal(Oid table_oid,
     opentde_pagestore_ensure_dir();
     path = opentde_pagestore_get_file_path(table_oid);
 
-
     /* Try to open file, create if missing, and initialize header if new */
     fd = open(path, O_RDWR | O_CREAT | PG_BINARY, 0600);
     if (fd < 0)
@@ -269,7 +262,20 @@ opentde_pagestore_append_tuple_internal(Oid table_oid,
     opentde_pagestore_replay_journal_if_needed(fd, table_oid, &hdr);
 
     elog(LOG, "OpenTDE: append_tuple_internal: before write, record_count=%u", hdr.record_count);
-    stored_blockno = use_explicit_blockno ? (uint32_t) blockno : hdr.record_count;
+
+    /* Гарантируем валидный stored_blockno */
+    if (use_explicit_blockno && blockno != InvalidBlockNumber)
+        stored_blockno = (uint32_t) blockno;
+    else
+        stored_blockno = hdr.record_count;
+
+    if (stored_blockno == InvalidBlockNumber) {
+        elog(ERROR, "OpenTDE: append_tuple_internal: stored_blockno is InvalidBlockNumber! blockno=%u use_explicit_blockno=%d hdr.record_count=%u", blockno, use_explicit_blockno, hdr.record_count);
+        opentde_pagestore_unlock_fd(fd);
+        close(fd);
+        pfree(path);
+        return false;
+    }
 
     if (!delete_marker)
     {
@@ -280,6 +286,7 @@ opentde_pagestore_append_tuple_internal(Oid table_oid,
                    FirstOffsetNumber);
 
         elog(LOG, "OpenTDE: about to call page_blob_encrypt: t_len=%u", (uint32_t)tuple->t_len);
+        /* page-level TDE: передаём корректный page_tid (offset=0) */
         int enc_ret = opentde_page_blob_encrypt(table_oid,
                                        (BlockNumber) stored_blockno,
                                        plain_copy,
@@ -335,6 +342,9 @@ opentde_pagestore_append_tuple(Oid table_oid,
 {
     /* Batch append: открывает файл, lock, вставляет все кортежи, fsync один раз */
     elog(LOG, "OpenTDE: append_tuple table_oid=%u tuple=%p t_len=%d", table_oid, tuple, tuple ? (int)tuple->t_len : -1);
+    ItemPointerData tmp_tid;
+    if (tid_out == NULL)
+        tid_out = &tmp_tid;
     return opentde_pagestore_append_tuple_internal(table_oid,
                                                    tuple,
                                                    InvalidBlockNumber,

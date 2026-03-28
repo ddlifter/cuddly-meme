@@ -1,3 +1,18 @@
+#include <curl/curl.h>
+#include <string.h>
+#include <stdlib.h>
+
+// Вспомогательная функция для записи ответа libcurl в буфер
+static size_t curl_write_cb(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t realsize = size * nmemb;
+    char **response_ptr = (char **)userp;
+    size_t old_len = *response_ptr ? strlen(*response_ptr) : 0;
+    *response_ptr = realloc(*response_ptr, old_len + realsize + 1);
+    if (*response_ptr == NULL) return 0;
+    memcpy(*response_ptr + old_len, contents, realsize);
+    (*response_ptr)[old_len + realsize] = '\0';
+    return realsize;
+}
 #include "opentde.h"
 #include <stddef.h>
 #include <stdbool.h>
@@ -9,6 +24,8 @@
  * Гарантирует, что мастер-ключ и DEK загружены в память процесса.
  * Если ключи не загружены — пытается загрузить их с диска/Vault.
  */
+opentde_key_manager *global_key_mgr = NULL; // Define the global key manager pointer (was only declared as extern)
+bool master_key_set = false; // Define the global master key set flag (was only declared as extern)
 void opentde_ensure_keys_loaded(void)
 {
     if (!master_key_set) {
@@ -19,7 +36,6 @@ void opentde_ensure_keys_loaded(void)
             if (!global_key_mgr)
                 opentde_init_key_manager();
             opentde_load_key_file();
-            opentde_load_iv_file();
         } else {
             elog(WARNING, "[OpenTDE] ensure_keys_loaded: failed to load master key from Vault");
         }
@@ -44,213 +60,8 @@ void opentde_ensure_keys_loaded(void)
 #include <unistd.h>
 
 #define OPENTDE_VAULT_ADDR_DEFAULT   "http://127.0.0.1:8200"
-#define OPENTDE_VAULT_PATH_DEFAULT   "secret/data/opentde/master"
-#define OPENTDE_VAULT_FIELD_DEFAULT  "key_hex"
-#define OPENTDE_VAULT_TOKEN_DEFAULT  "root"
-#define OPENTDE_IV_FLUSH_EVERY       1000
 
-typedef struct {
-    Oid          table_oid;
-    BlockNumber  block;
-    OffsetNumber offset;
-} opentde_iv_hash_key;
 
-typedef struct {
-    opentde_iv_hash_key key;
-    int                 index;
-} opentde_iv_hash_entry;
-
-/* Формат записи key-файла до KEY_VERSION=3 */
-typedef struct {
-    Oid      table_oid;
-    uint8_t  wrapped_dek[WRAPPED_DEK_SIZE];
-    uint64_t created_at;
-} key_file_entry_v2;
-
-/* Формат записи iv-файла до IV_VERSION=2 */
-typedef struct {
-    Oid          table_oid;
-    BlockNumber  block;
-    OffsetNumber offset;
-    uint16_t     pad;
-    uint8_t      iv[DATA_IV_SIZE];
-    uint64_t     created_at;
-} iv_file_entry_v1;
-
-/* Синглтон менеджера ключей; инициализируется при первом обращении */
-opentde_key_manager *global_key_mgr = NULL;
-
-/* Флаг: мастер-ключ установлен */
-bool master_key_set = false;
-
-/* Счётчик несброшенных IV-изменений для пакетной записи на диск. */
-static int opentde_pending_iv_flush = 0;
-/* Хеш-индекс IV по (table_oid, block, offset) -> index в global_key_mgr->ivs */
-static HTAB *opentde_iv_hash = NULL;
-/* Сколько записей сейчас в iv-файле на диске. */
-static uint32 opentde_iv_file_entry_count = 0;
-
-static char *get_iv_file_path(void);
-
-static void
-opentde_append_iv_file_entry(Oid table_oid,
-                             BlockNumber block,
-                             OffsetNumber offset,
-                             uint32_t key_version,
-                             const uint8_t *iv)
-{
-    char          *iv_path;
-    int            fd;
-    struct stat    st;
-    iv_file_header header;
-    iv_file_entry  entry;
-
-    opentde_ensure_key_directory();
-    iv_path = get_iv_file_path();
-    fd = open(iv_path, O_RDWR | O_CREAT | PG_BINARY, 0600);
-    if (fd < 0)
-    {
-        pfree(iv_path);
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("cannot open iv file %s", iv_path)));
-    }
-
-    if (fstat(fd, &st) != 0)
-    {
-        close(fd);
-        pfree(iv_path);
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("cannot stat iv file %s", iv_path)));
-    }
-
-    if ((size_t) st.st_size < sizeof(iv_file_header))
-    {
-        memset(&header, 0, sizeof(header));
-        header.magic = IV_FILE_MAGIC;
-        header.version = IV_VERSION;
-        header.iv_count = 0;
-
-        if (pwrite(fd, &header, sizeof(header), 0) != sizeof(header))
-        {
-            close(fd);
-            pfree(iv_path);
-            ereport(ERROR,
-                    (errcode_for_file_access(),
-                     errmsg("cannot write iv file header")));
-        }
-        opentde_iv_file_entry_count = 0;
-    }
-    else
-    {
-        if (pread(fd, &header, sizeof(header), 0) != sizeof(header))
-        {
-            close(fd);
-            pfree(iv_path);
-            ereport(ERROR,
-                    (errcode_for_file_access(),
-                     errmsg("cannot read iv file header")));
-        }
-        opentde_iv_file_entry_count = header.iv_count;
-    }
-
-    memset(&entry, 0, sizeof(entry));
-    entry.table_oid = table_oid;
-    entry.block = block;
-    entry.offset = offset;
-    entry.key_version = key_version;
-    entry.created_at = (uint64_t) time(NULL);
-    memcpy(entry.iv, iv, DATA_IV_SIZE);
-
-    if (lseek(fd, 0, SEEK_END) < 0 ||
-        write(fd, &entry, sizeof(entry)) != sizeof(entry))
-    {
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("cannot append iv entry")));
-    }
-
-    header.magic = IV_FILE_MAGIC;
-    header.version = IV_VERSION;
-    header.iv_count = ++opentde_iv_file_entry_count;
-    if (pwrite(fd, &header, sizeof(header), 0) != sizeof(header))
-    {
-        close(fd);
-        pfree(iv_path);
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("cannot update iv file header")));
-    }
-
-    close(fd);
-    pfree(iv_path);
-}
-
-static void
-opentde_init_iv_hash(void)
-{
-    HASHCTL ctl;
-
-    if (opentde_iv_hash)
-        return;
-
-    MemSet(&ctl, 0, sizeof(ctl));
-    ctl.keysize = sizeof(opentde_iv_hash_key);
-    ctl.entrysize = sizeof(opentde_iv_hash_entry);
-    ctl.hcxt = TopMemoryContext;
-
-    opentde_iv_hash = hash_create("OpenTDE tuple IV hash",
-                                  INITIAL_IV_CAPACITY,
-                                  &ctl,
-                                  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-}
-
-static void
-opentde_iv_hash_put(Oid table_oid, BlockNumber block, OffsetNumber offset, int index)
-{
-    opentde_iv_hash_key key;
-    opentde_iv_hash_entry *entry;
-    bool found;
-
-    opentde_init_iv_hash();
-
-    MemSet(&key, 0, sizeof(key));
-    key.table_oid = table_oid;
-    key.block = block;
-    key.offset = offset;
-
-    entry = (opentde_iv_hash_entry *) hash_search(opentde_iv_hash,
-                                                  &key,
-                                                  HASH_ENTER,
-                                                  &found);
-    entry->index = index;
-}
-
-static bool
-opentde_iv_hash_get(Oid table_oid, BlockNumber block, OffsetNumber offset, int *index_out)
-{
-    opentde_iv_hash_key key;
-    opentde_iv_hash_entry *entry;
-
-    if (!opentde_iv_hash)
-        return false;
-
-    MemSet(&key, 0, sizeof(key));
-    key.table_oid = table_oid;
-    key.block = block;
-    key.offset = offset;
-
-    entry = (opentde_iv_hash_entry *) hash_search(opentde_iv_hash,
-                                                  &key,
-                                                  HASH_FIND,
-                                                  NULL);
-    if (!entry)
-        return false;
-
-    *index_out = entry->index;
-    return true;
-}
 
 typedef struct {
     char   *data;
@@ -315,6 +126,7 @@ opentde_parse_http_url(const char *url,
     if (strncmp(url, "http://", 7) != 0)
         return false;
 
+    // Для Vault kv v2: ищем "data":{"data":{"master_key":"..."}}
     p = url + 7;
     host_start = p;
 
@@ -447,25 +259,6 @@ opentde_http_send_request(const char *host,
 }
 
 /* Вытаскивает последний HTTP status code из блока с сохранёнными заголовками. */
-static long
-opentde_extract_http_code(const char *headers_and_body)
-{
-    const char *p;
-    long        code;
-    long        last_code;
-
-    p = headers_and_body;
-    last_code = 0;
-
-    while ((p = strstr(p, "HTTP/")) != NULL)
-    {
-        if (sscanf(p, "HTTP/%*d.%*d %ld", &code) == 1)
-            last_code = code;
-        p += 5;
-    }
-
-    return last_code;
-}
 
 /* Отделяет body от блока "headers + body" */
 static char *
@@ -521,14 +314,14 @@ opentde_vault_build_url(void)
 {
     const char *addr;
     const char *path;
-
     addr = opentde_getenv_or_default("OPENTDE_VAULT_ADDR", OPENTDE_VAULT_ADDR_DEFAULT);
     path = opentde_getenv_or_default("OPENTDE_VAULT_PATH", OPENTDE_VAULT_PATH_DEFAULT);
-
-    while (*path == '/')
-        path++;
-
-    return psprintf("%s/v1/%s", addr, path);
+    if (strncmp(path, "secret/data/", 12) == 0)
+        return psprintf("%s/v1/%s", addr, path);
+    else if (strncmp(path, "secret/", 7) == 0)
+        return psprintf("%s/v1/secret/data/%s", addr, path + 7);
+    else
+        return psprintf("%s/v1/secret/data/%s", addr, path);
 }
 
 /* Выполняет HTTP-запрос к Vault API */
@@ -539,69 +332,59 @@ opentde_vault_http_request(const char *method,
                            long *http_code_out,
                            char **response_out)
 {
-    const char           *token;
-    const char           *payload_text;
-    char                 *host;
-    char                 *path;
-    char                 *request;
-    char                 *raw_body;
-    int                   port;
-    long                  code;
-    size_t                payload_len;
-    opentde_http_response resp;
+    const char *token = opentde_getenv_or_default("OPENTDE_VAULT_TOKEN", OPENTDE_VAULT_TOKEN_DEFAULT);
+    const char *addr = opentde_getenv_or_default("OPENTDE_VAULT_ADDR", OPENTDE_VAULT_ADDR_DEFAULT);
+    const char *path = opentde_getenv_or_default("OPENTDE_VAULT_PATH", OPENTDE_VAULT_PATH_DEFAULT);
+    const char *field = opentde_getenv_or_default("OPENTDE_VAULT_FIELD", OPENTDE_VAULT_FIELD_DEFAULT);
+    elog(WARNING, "[OpenTDE] Vault ENV: ADDR='%s' PATH='%s' FIELD='%s' TOKEN='%s'", addr, path, field, token);
+    bool ok = false;
 
     *http_code_out = 0;
     *response_out = NULL;
 
-    token = opentde_getenv_or_default("OPENTDE_VAULT_TOKEN", OPENTDE_VAULT_TOKEN_DEFAULT);
+    CURL *curl;
+    CURLcode res;
+    struct curl_slist *headers = NULL;
+    char *response = calloc(1, 1);
+    long http_code = 0;
 
-    if (!opentde_parse_http_url(url, &host, &port, &path))
-        return false;
-
-    payload_text = payload ? payload : "";
-    payload_len = strlen(payload_text);
-
-    request = psprintf(
-        "%s %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "X-Vault-Token: %s\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "%s",
-        method,
-        path,
-        host,
-        token,
-        payload_len,
-        payload_text);
-    if (!opentde_http_send_request(host, port, request, &resp))
-    {
-        pfree(request);
-        pfree(path);
-        pfree(host);
+    curl = curl_easy_init();
+    if (!curl) {
+        free(response);
         return false;
     }
 
-    pfree(request);
-    pfree(path);
-    pfree(host);
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    char token_hdr[256];
+    snprintf(token_hdr, sizeof(token_hdr), "X-Vault-Token: %s", token);
+    headers = curl_slist_append(headers, token_hdr);
 
-    code = opentde_extract_http_code(resp.data);
-    raw_body = opentde_extract_http_body(resp.data);
-    free(resp.data);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L); // Включить подробный вывод для диагностики
 
-    if (!raw_body)
-        return false;
+    if (payload && strcmp(method, "GET") != 0) {
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
+    }
 
-    *http_code_out = code;
-    *response_out = raw_body;
+    res = curl_easy_perform(curl);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
-    if (*http_code_out == 0)
-        *http_code_out = 500;
+    if (res == CURLE_OK && http_code > 0) {
+        *http_code_out = http_code;
+        *response_out = response;
+        ok = true;
+    } else {
+        free(response);
+    }
 
-    return true;
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return ok;
 }
 
 /* Ищет строковое поле JSON вида "<field>":"<value>" и возвращает копию value. */
@@ -718,13 +501,7 @@ opentde_init_key_manager(void)
         TopMemoryContext,
         global_key_mgr->key_capacity * sizeof(opentde_key_entry));
 
-    /* Массив IV кортежей */
-    global_key_mgr->iv_capacity = INITIAL_IV_CAPACITY;
-    global_key_mgr->ivs = MemoryContextAllocZero(
-        TopMemoryContext,
-        global_key_mgr->iv_capacity * sizeof(opentde_iv_entry));
 
-    opentde_init_iv_hash();
 }
 
 /*
@@ -797,43 +574,21 @@ opentde_load_key_file(void)
 
         dst = &global_key_mgr->keys[global_key_mgr->key_count];
 
-        if (header.version == 2)
+        key_file_entry entry;
+
+        if (read(fd, &entry, sizeof(key_file_entry)) != sizeof(key_file_entry))
+            break;
+
+        dst->table_oid = entry.table_oid;
+        dst->key_version = entry.key_version == 0 ? DEFAULT_DEK_VERSION : entry.key_version;
+        dst->is_active = (entry.is_active != 0);
+        memcpy(dst->wrapped_dek, entry.wrapped_dek, WRAPPED_DEK_SIZE);
+
+        if (!opentde_unwrap_dek(global_key_mgr->master_key,
+                                entry.wrapped_dek,
+                                dst->dek))
         {
-            key_file_entry_v2 entry_v2;
-
-            if (read(fd, &entry_v2, sizeof(key_file_entry_v2)) != sizeof(key_file_entry_v2))
-                break;
-
-            dst->table_oid = entry_v2.table_oid;
-            dst->key_version = DEFAULT_DEK_VERSION;
-            dst->is_active = true;
-            memcpy(dst->wrapped_dek, entry_v2.wrapped_dek, WRAPPED_DEK_SIZE);
-
-            if (!opentde_unwrap_dek(global_key_mgr->master_key,
-                                    entry_v2.wrapped_dek,
-                                    dst->dek))
-            {
-                continue;
-            }
-        }
-        else
-        {
-            key_file_entry entry;
-
-            if (read(fd, &entry, sizeof(key_file_entry)) != sizeof(key_file_entry))
-                break;
-
-            dst->table_oid = entry.table_oid;
-            dst->key_version = entry.key_version == 0 ? DEFAULT_DEK_VERSION : entry.key_version;
-            dst->is_active = (entry.is_active != 0);
-            memcpy(dst->wrapped_dek, entry.wrapped_dek, WRAPPED_DEK_SIZE);
-
-            if (!opentde_unwrap_dek(global_key_mgr->master_key,
-                                    entry.wrapped_dek,
-                                    dst->dek))
-            {
-                continue;
-            }
+            continue;
         }
 
         global_key_mgr->key_count++;
@@ -918,305 +673,14 @@ opentde_save_key_file(void)
     pfree(key_path);
 }
 
-/*
- * Загрузка файла IV с диска.
- * Вызывается при старте бэкенда (из _PG_init) или при установке мастер-ключа.
- */
-bool
-opentde_load_iv_file(void)
-{
-    char            *iv_path;
-    int              fd;
-    iv_file_header   header;
-    uint32_t         i;
-    int              entries_read;
-
-    if (!global_key_mgr || global_key_mgr->iv_count > 0)
-        return false;
-
-    iv_path = get_iv_file_path();
-    entries_read = 0;
-
-    fd = open(iv_path, O_RDONLY | PG_BINARY, 0600);
-    if (fd < 0)
-    {
-        pfree(iv_path);
-        return false;
-    }
-
-    /* Валидация заголовка: magic + версия */
-    if (read(fd, &header, sizeof(iv_file_header)) != sizeof(iv_file_header))
-    {
-        close(fd);
-        pfree(iv_path);
-        return false;
-    }
-
-    if (header.magic != IV_FILE_MAGIC || (header.version != 1 && header.version != IV_VERSION))
-    {
-        close(fd);
-        pfree(iv_path);
-        return false;
-    }
-
-    opentde_iv_file_entry_count = header.iv_count;
-
-    /* Чтение записей IV */
-    for (i = 0; i < header.iv_count; i++)
-    {
-        opentde_iv_entry *dst;
-
-        /* Расширение динамического массива при необходимости */
-        if (global_key_mgr->iv_count >= global_key_mgr->iv_capacity)
-        {
-            global_key_mgr->iv_capacity *= 2;
-            global_key_mgr->ivs = repalloc(
-                global_key_mgr->ivs,
-                global_key_mgr->iv_capacity * sizeof(opentde_iv_entry));
-        }
-
-        dst = &global_key_mgr->ivs[global_key_mgr->iv_count];
-
-        if (header.version == 1)
-        {
-            iv_file_entry_v1 entry_v1;
-
-            if (read(fd, &entry_v1, sizeof(iv_file_entry_v1)) != sizeof(iv_file_entry_v1))
-                break;
-
-            dst->table_oid = entry_v1.table_oid;
-            dst->block = entry_v1.block;
-            dst->offset = entry_v1.offset;
-            dst->key_version = DEFAULT_DEK_VERSION;
-            memcpy(dst->iv, entry_v1.iv, DATA_IV_SIZE);
-        }
-        else
-        {
-            iv_file_entry entry;
-
-            if (read(fd, &entry, sizeof(iv_file_entry)) != sizeof(iv_file_entry))
-                break;
-
-            dst->table_oid = entry.table_oid;
-            dst->block = entry.block;
-            dst->offset = entry.offset;
-            dst->key_version = entry.key_version == 0 ? DEFAULT_DEK_VERSION : entry.key_version;
-            memcpy(dst->iv, entry.iv, DATA_IV_SIZE);
-        }
-
-        global_key_mgr->iv_count++;
-        opentde_iv_hash_put(dst->table_oid, dst->block, dst->offset,
-                            global_key_mgr->iv_count - 1);
-        entries_read++;
-    }
-
-    close(fd);
-    elog(DEBUG1, "[OpenTDE] Loaded %d tuple IVs from %s", entries_read, iv_path);
-    pfree(iv_path);
-    opentde_pending_iv_flush = 0;
-    return true;
-}
-
-/*
- * Сохранение всех IV в файл. Файл перезаписывается целиком.
- */
-void
-opentde_save_iv_file(void)
-{
-    char *iv_path;
-    int fd;
-    iv_file_header header;
-    uint32_t i;
-
-    if (!global_key_mgr)
-        ereport(ERROR,
-                (errcode(ERRCODE_INTERNAL_ERROR),
-                 errmsg("key manager is not initialized")));
-
-    iv_path = get_iv_file_path();
-    fd = open(iv_path, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY, 0600);
-    if (fd < 0)
-    {
-        pfree(iv_path);
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("cannot open IV file for writing: %s", iv_path)));
-    }
-
-    header.magic = IV_FILE_MAGIC;
-    header.version = IV_VERSION;
-    header.iv_count = global_key_mgr->iv_count;
-
-    if (write(fd, &header, sizeof(iv_file_header)) != sizeof(iv_file_header))
-    {
-        close(fd);
-        pfree(iv_path);
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("cannot write IV file header")));
-    }
-
-    for (i = 0; i < global_key_mgr->iv_count; i++)
-    {
-        iv_file_entry entry;
-        entry.table_oid = global_key_mgr->ivs[i].table_oid;
-        entry.block = global_key_mgr->ivs[i].block;
-        entry.offset = global_key_mgr->ivs[i].offset;
-        entry.key_version = global_key_mgr->ivs[i].key_version;
-        memcpy(entry.iv, global_key_mgr->ivs[i].iv, DATA_IV_SIZE);
-
-        if (write(fd, &entry, sizeof(iv_file_entry)) != sizeof(iv_file_entry))
-        {
-            close(fd);
-            pfree(iv_path);
-            ereport(ERROR,
-                    (errcode_for_file_access(),
-                     errmsg("cannot write iv entry %d", i)));
-        }
-    }
-
-    close(fd);
-    pfree(iv_path);
-    opentde_pending_iv_flush = 0;
-    opentde_iv_file_entry_count = (uint32) global_key_mgr->iv_count;
-}
 
 
-/*
- * Регистрация IV для кортежа.
- */
-void
-opentde_register_tuple_iv(Oid table_oid, const ItemPointer tid,
-                          const uint8_t *iv, uint32_t key_version)
-{
-    BlockNumber  block;
-    OffsetNumber offset;
-    int          i;
-    int          cached_index = -1;
 
-    if (!global_key_mgr || !ItemPointerIsValid(tid))
-        ereport(ERROR,
-                (errcode(ERRCODE_INTERNAL_ERROR),
-                 errmsg("cannot register tuple IV without a valid TID")));
 
-    block  = ItemPointerGetBlockNumber(tid);
-    offset = ItemPointerGetOffsetNumber(tid);
 
-    if (key_version == 0)
-        key_version = DEFAULT_DEK_VERSION;
 
-    if (opentde_iv_hash_get(table_oid, block, offset, &cached_index) &&
-        cached_index >= 0 &&
-        cached_index < global_key_mgr->iv_count)
-    {
-        opentde_iv_entry *entry = &global_key_mgr->ivs[cached_index];
 
-        if (entry->table_oid == table_oid &&
-            entry->block == block &&
-            entry->offset == offset)
-        {
-            memcpy(entry->iv, iv, DATA_IV_SIZE);
-            entry->key_version = key_version;
-            opentde_append_iv_file_entry(table_oid, block, offset,
-                                         key_version, iv);
-            return;
-        }
-    }
 
-    /* Поиск существующей записи (обновление при UPDATE) */
-    for (i = 0; i < global_key_mgr->iv_count; i++)
-    {
-        opentde_iv_entry *entry = &global_key_mgr->ivs[i];
-
-        if (entry->table_oid == table_oid &&
-            entry->block == block &&
-            entry->offset == offset)
-        {
-            memcpy(entry->iv, iv, DATA_IV_SIZE);
-            entry->key_version = key_version;
-            opentde_iv_hash_put(table_oid, block, offset, i);
-            opentde_append_iv_file_entry(table_oid, block, offset,
-                                         key_version, iv);
-            return;
-        }
-    }
-
-    /* Расширение массива при необходимости */
-    if (global_key_mgr->iv_count >= global_key_mgr->iv_capacity)
-    {
-        global_key_mgr->iv_capacity *= 2;
-        global_key_mgr->ivs = repalloc(
-            global_key_mgr->ivs,
-            global_key_mgr->iv_capacity * sizeof(opentde_iv_entry));
-    }
-
-    /* Добавление новой записи */
-    global_key_mgr->ivs[global_key_mgr->iv_count].table_oid = table_oid;
-    global_key_mgr->ivs[global_key_mgr->iv_count].block     = block;
-    global_key_mgr->ivs[global_key_mgr->iv_count].offset    = offset;
-    global_key_mgr->ivs[global_key_mgr->iv_count].key_version = key_version;
-    memcpy(global_key_mgr->ivs[global_key_mgr->iv_count].iv, iv, DATA_IV_SIZE);
-    opentde_iv_hash_put(table_oid, block, offset, global_key_mgr->iv_count);
-    global_key_mgr->iv_count++;
-
-    opentde_append_iv_file_entry(table_oid, block, offset,
-                                 key_version, iv);
-}
-
-/*
- * Поиск IV для кортежа по TID.
- */
-bool
-opentde_lookup_tuple_iv(Oid table_oid, const ItemPointer tid,
-                        uint8_t *iv_out, uint32_t *key_version_out)
-{
-    int          i;
-    BlockNumber  block;
-    OffsetNumber offset;
-    int          cached_index = -1;
-
-    if (!global_key_mgr || !ItemPointerIsValid(tid))
-        return false;
-
-    block  = ItemPointerGetBlockNumber(tid);
-    offset = ItemPointerGetOffsetNumber(tid);
-
-    if (opentde_iv_hash_get(table_oid, block, offset, &cached_index) &&
-        cached_index >= 0 &&
-        cached_index < global_key_mgr->iv_count)
-    {
-        opentde_iv_entry *entry = &global_key_mgr->ivs[cached_index];
-
-        if (entry->table_oid == table_oid &&
-            entry->block == block &&
-            entry->offset == offset)
-        {
-            memcpy(iv_out, entry->iv, DATA_IV_SIZE);
-            if (key_version_out)
-                *key_version_out = entry->key_version == 0 ? DEFAULT_DEK_VERSION : entry->key_version;
-            return true;
-        }
-    }
-
-    /* Обратный обход — последняя запись наиболее актуальна */
-    for (i = global_key_mgr->iv_count - 1; i >= 0; i--)
-    {
-        opentde_iv_entry *entry = &global_key_mgr->ivs[i];
-
-        if (entry->table_oid == table_oid &&
-            entry->block == block &&
-            entry->offset == offset)
-        {
-            opentde_iv_hash_put(table_oid, block, offset, i);
-            memcpy(iv_out, entry->iv, DATA_IV_SIZE);
-            if (key_version_out)
-                *key_version_out = entry->key_version == 0 ? DEFAULT_DEK_VERSION : entry->key_version;
-            return true;
-        }
-    }
-
-    return false;
-}
 
 /*
  * Автозагрузка мастер-ключа из Vault.
@@ -1236,12 +700,13 @@ opentde_load_master_key_from_file(void)
 
     url = opentde_vault_build_url();
     field_name = opentde_getenv_or_default("OPENTDE_VAULT_FIELD", OPENTDE_VAULT_FIELD_DEFAULT);
+    elog(WARNING, "[OpenTDE] Using VAULT_FIELD='%s'", field_name);
     vault_path = opentde_getenv_or_default("OPENTDE_VAULT_PATH", OPENTDE_VAULT_PATH_DEFAULT);
 
     ok = opentde_vault_http_request("GET", url, NULL, &http_code, &response);
     pfree(url);
 
-    if (!ok)
+    if (!ok) 
     {
         elog(WARNING, "[OpenTDE] Vault GET request failed while loading master key");
         return false;
