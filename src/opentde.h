@@ -1,20 +1,8 @@
-/*
- * opentde.h — Общий заголовочный файл расширения OpenTDE.
- *
- * Содержит:
- *   - Константы (размеры ключей, пути к файлам, magic-значения)
- *   - Определения структур данных (менеджер ключей, записи ключей и IV)
- *   - Прототипы функций, общие для всех модулей
- *
- * Архитектура расширения:
- *   opentde_keymanager.c  — управление мастер-ключом, DEK и IV (файловое хранилище)
- *   opentde_crypto.c      — криптографические операции (wrap/unwrap DEK, шифрование кортежей)
- *   opentde_tableam.c     — реализация Table AM (insert, update, scan, index)
- *   opentde_sql.c         — SQL-функции, вызываемые пользователем
- *   kuznechik.c / .h      — реализация шифра «Кузнечик» (ГОСТ Р 34.12-2015) в режиме CTR
- */
+
 #ifndef OPENTDE_H
 #define OPENTDE_H
+
+#include <stdbool.h>
 
 #include "postgres.h"
 #include "access/heapam.h"
@@ -32,9 +20,30 @@
 
 #include "kuznechik.h"
 
-/* =====================================================================
- * Константы
- * ===================================================================== */
+extern bool opentde_pagestore_journal;
+void opentde_pagestore_journal_guc_init(void);
+extern bool opentde_pagestore_fsync;
+void opentde_pagestore_guc_init(void);
+bool opentde_pagestore_multi_insert(Oid table_oid,
+                                    HeapTuple *tuples,
+                                    int nslots,
+                                    ItemPointerData *tids_out);
+
+#include "postgres.h"
+#include "access/heapam.h"
+#include "access/htup_details.h"
+#include "access/tableam.h"
+#include "executor/executor.h"
+#include "executor/tuptable.h"
+#include "fmgr.h"
+#include "storage/bufmgr.h"
+#include "storage/bufpage.h"
+#include "storage/itemid.h"
+#include "utils/builtins.h"
+#include "utils/memutils.h"
+#include "utils/rel.h"
+
+#include "kuznechik.h"
 
 /* Пути к файлам хранения ключей внутри PGDATA */
 #define KEY_FILE_PATH   "pg_encryption/keys"
@@ -52,27 +61,27 @@
 /* Начальная версия DEK для таблицы */
 #define DEFAULT_DEK_VERSION 1
 
-/* Размеры криптографических параметров (в байтах) */
-#define MASTER_KEY_SIZE   32                           /* Мастер-ключ: 256 бит */
-#define DEK_SIZE          32                           /* Ключ шифрования данных (DEK): 256 бит */
-#define DATA_IV_SIZE      16                           /* Вектор инициализации: 128 бит */
-#define WRAPPED_DEK_SIZE  (DATA_IV_SIZE + DEK_SIZE)    /* Обёрнутый DEK = IV + зашифрованный DEK */
+/* Размеры криптографических параметров в байтах */
+#define MASTER_KEY_SIZE   32
+#define DEK_SIZE          32
+#define DATA_IV_SIZE      16
+#define WRAPPED_DEK_SIZE  (DATA_IV_SIZE + DEK_SIZE)
+
+/* Формат зашифрованного page-blob (переходный шаг к page-level хранению). */
+#define OPENTDE_PAGE_BLOB_MAGIC   0x4F545047U  /* ASCII "OTPG" */
+#define OPENTDE_PAGE_BLOB_VERSION 1
 
 /* Начальные размеры динамических массивов */
 #define INITIAL_KEY_CAPACITY  64
 #define INITIAL_IV_CAPACITY   1024
-
-/* =====================================================================
- * Структуры данных — формат файлов на диске
- * ===================================================================== */
 
 /*
  * Заголовок файла ключей (pg_encryption/keys).
  * Формат: [заголовок][запись_1][запись_2]...[запись_N]
  */
 typedef struct {
-    uint32_t magic;         /* Должно быть KEY_FILE_MAGIC */
-    uint8_t  version;       /* Версия формата */
+    uint32_t magic;
+    uint8_t  version;
     uint8_t  pad[3];        /* Выравнивание */
     uint32_t key_count;     /* Количество записей */
     uint32_t reserved[13];  /* Резерв для будущих полей */
@@ -80,7 +89,7 @@ typedef struct {
 
 /*
  * Одна запись в файле ключей.
- * Хранит обёрнутый (зашифрованный мастер-ключом) DEK для конкретной таблицы.
+ * Хранит зашифрованный мастер-ключом DEK для конкретной таблицы.
  */
 typedef struct {
     Oid      table_oid;                      /* OID таблицы */
@@ -117,12 +126,8 @@ typedef struct {
     uint64_t     created_at;       /* Время создания */
 } iv_file_entry;
 
-/* =====================================================================
- * Структуры данных — состояние в памяти
- * ===================================================================== */
-
 /*
- * Расшифрованный DEK для одной таблицы (хранится в памяти процесса).
+ * Расшифрованный DEK для одной таблицы.
  */
 typedef struct {
     uint8_t dek[DEK_SIZE];                   /* Расшифрованный ключ таблицы */
@@ -157,15 +162,8 @@ typedef struct {
     int               iv_capacity;
 } opentde_key_manager;
 
-/* =====================================================================
- * Глобальные переменные (определены в opentde_keymanager.c)
- * ===================================================================== */
 extern opentde_key_manager *global_key_mgr;
 extern bool master_key_set;
-
-/* =====================================================================
- * Прототипы — opentde_keymanager.c
- * ===================================================================== */
 
 /* Инициализация менеджера ключей (выделение памяти) */
 void opentde_init_key_manager(void);
@@ -194,10 +192,6 @@ void opentde_register_tuple_iv(Oid table_oid, const ItemPointer tid,
 bool opentde_lookup_tuple_iv(Oid table_oid, const ItemPointer tid,
                                                          uint8_t *iv_out, uint32_t *key_version_out);
 
-/* =====================================================================
- * Прототипы — opentde_crypto.c
- * ===================================================================== */
-
 /* Генерация криптографически стойких случайных байт */
 void opentde_fill_random_bytes(uint8_t *buf, size_t len,
                                const char *context_name);
@@ -224,5 +218,69 @@ void opentde_gost_encrypt_decrypt(char *data, int len, Oid table_oid,
 int opentde_encrypt_tuple_inplace(HeapTuple tuple, Oid table_oid,
                                   uint8_t *iv_out,
                                   uint32_t *key_version_out);
+
+/*
+ * Сериализация page-blob: [header][ciphertext payload].
+ * Используется как фундамент для перехода к настоящему page-level AM.
+ */
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t header_len;
+    Oid      table_oid;
+    uint32_t blockno;
+    uint32_t key_version;
+    uint8_t  iv[DATA_IV_SIZE];
+    uint32_t payload_len;
+    uint32_t checksum;
+} opentde_page_blob_header;
+
+bool opentde_page_blob_encrypt(Oid table_oid,
+                               BlockNumber blockno,
+                               const uint8_t *plain,
+                               uint32_t plain_len,
+                               uint8_t **blob_out,
+                               uint32_t *blob_len_out);
+
+bool opentde_page_blob_decrypt(Oid expected_table_oid,
+                               BlockNumber expected_blockno,
+                               const uint8_t *blob,
+                               uint32_t blob_len,
+                               uint8_t **plain_out,
+                               uint32_t *plain_len_out,
+                               uint32_t *key_version_out);
+
+/*
+ * Append-only encrypted page-image storage used by opentde_page AM.
+ * This is a transition toward true page-level I/O path.
+ */
+typedef struct {
+    int      fd;
+    Oid      table_oid;
+    uint32_t total_records;
+    uint32_t current_record;
+    uint64_t next_offset;
+    uint32_t max_blockno;
+    void    *row_states;
+    bool     is_open;
+} opentde_pagestore_scan;
+
+bool opentde_pagestore_append_tuple(Oid table_oid,
+                                    HeapTuple tuple,
+                                    ItemPointerData *tid_out);
+bool opentde_pagestore_update_tuple(Oid table_oid,
+                                    BlockNumber blockno,
+                                    HeapTuple tuple,
+                                    ItemPointerData *tid_out);
+bool opentde_pagestore_delete_tuple(Oid table_oid,
+                                    BlockNumber blockno);
+bool opentde_pagestore_fetch_latest(Oid table_oid,
+                                    BlockNumber blockno,
+                                    HeapTuple *tuple_out);
+bool opentde_pagestore_scan_open(Oid table_oid,
+                                 opentde_pagestore_scan *scan);
+bool opentde_pagestore_scan_next(opentde_pagestore_scan *scan,
+                                 HeapTuple *tuple_out);
+void opentde_pagestore_scan_close(opentde_pagestore_scan *scan);
 
 #endif /* OPENTDE_H */

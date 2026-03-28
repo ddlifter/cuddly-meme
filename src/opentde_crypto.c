@@ -1,43 +1,14 @@
-/*
- * opentde_crypto.c — Криптографический модуль OpenTDE.
- *
- * Отвечает за:
- *   - Генерацию криптографически стойких случайных чисел
- *   - Обёртывание (wrap) и разворачивание (unwrap) DEK мастер-ключом
- *   - Получение или создание DEK для конкретной таблицы
- *   - Шифрование/дешифрование данных шифром «Кузнечик» (ГОСТ Р 34.12-2015)
- *     в режиме CTR (гаммирование)
- *   - Шифрование payload кортежа в памяти перед записью в heap
- *
- * Схема шифрования:
- *   1. Для каждого кортежа генерируется случайный 128-битный IV
- *   2. DEK таблицы используется как ключ шифра «Кузнечик»
- *   3. Шифрование выполняется в режиме CTR: XOR открытого текста с гаммой
- *   4. Дешифрование — повторное применение той же операции (CTR симметричен)
- *
- * Шифрование выполняется ДО вызова heap_insert/heap_update/heap_multi_insert,
- * чтобы в WAL-журнал попадали уже зашифрованные данные.
- */
 #include "opentde.h"
-
-#include "port.h"                  /* PG_BINARY */
-
+#include "port.h"
 #include <string.h>
-
-/* =====================================================================
- * Генерация случайных чисел
- * ===================================================================== */
 
 /*
  * Генерация криптографически стойких случайных байт.
- * Использует pg_strong_random() из PostgreSQL (обёртка над /dev/urandom
- * или CryptGenRandom на Windows).
+ * Использует pg_strong_random() из PostgreSQL (обёртка над /dev/urandom)
  *
- * context_name — описание контекста для сообщения об ошибке.
  */
 void
-opentde_fill_random_bytes(uint8_t *buf, size_t len,
-                          const char *context_name)
+opentde_fill_random_bytes(uint8_t *buf, size_t len, const char *context_name)
 {
     if (!pg_strong_random(buf, len))
         ereport(ERROR,
@@ -46,20 +17,9 @@ opentde_fill_random_bytes(uint8_t *buf, size_t len,
                         context_name)));
 }
 
-/* =====================================================================
- * Обёртывание / разворачивание DEK
- *
- * DEK хранится на диске в обёрнутом виде:
- *   wrapped_dek = [IV (16 байт)] [зашифрованный DEK (32 байта)]
- *
- * Для обёртывания: генерируем случайный IV, шифруем DEK в режиме CTR
- * мастер-ключом. Для разворачивания: берём IV из первых 16 байт,
- * расшифровываем оставшиеся 32 байта.
- * ===================================================================== */
-
 /*
- * Обёртывание DEK: шифрование мастер-ключом для хранения на диске.
- * wrapped — буфер WRAPPED_DEK_SIZE (48 байт): [IV][encrypted_DEK].
+ * Шифруем DEK
+ * На диске лежит как [IV][encrypted_DEK]
  */
 void
 opentde_wrap_dek(const uint8_t *master_key, const uint8_t *dek,
@@ -74,7 +34,7 @@ opentde_wrap_dek(const uint8_t *master_key, const uint8_t *dek,
 }
 
 /*
- * Разворачивание DEK: расшифровка из файла на диске.
+ * Дешифруем DEK
  * Извлекает IV из первых 16 байт wrapped_dek, затем
  * расшифровывает оставшиеся 32 байт.
  */
@@ -89,10 +49,6 @@ opentde_unwrap_dek(const uint8_t *master_key, const uint8_t *wrapped_dek,
     kuz_ctr_crypt(master_key, iv, dek, DEK_SIZE);
     return true;
 }
-
-/* =====================================================================
- * Управление DEK таблиц
- * ===================================================================== */
 
 /* Увеличивает массив ключей при необходимости. */
 static void
@@ -124,7 +80,82 @@ opentde_find_table_key_index(Oid table_oid, uint32_t key_version)
     return -1;
 }
 
-/* Ищет активный DEK для таблицы; если активный флаг потерян, активирует max(version). */
+/* Возвращает прямой указатель на DEK указанной версии без лишних аллокаций. */
+static const uint8_t *
+opentde_get_table_dek_ptr_by_version(Oid table_oid, uint32_t key_version)
+{
+    static Oid      cached_table_oid = InvalidOid;
+    static uint32_t cached_key_version = 0;
+    static int      cached_idx = -1;
+    static int      cached_key_count = -1;
+    int idx;
+
+    if (!master_key_set || !global_key_mgr)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("master key not set")));
+    }
+
+    if (cached_idx >= 0 &&
+        cached_key_count == global_key_mgr->key_count &&
+        cached_idx < global_key_mgr->key_count)
+    {
+        opentde_key_entry *cached = &global_key_mgr->keys[cached_idx];
+
+        if (cached_table_oid == table_oid &&
+            cached_key_version == key_version &&
+            cached->table_oid == table_oid &&
+            cached->key_version == key_version)
+            return cached->dek;
+    }
+
+    idx = opentde_find_table_key_index(table_oid, key_version);
+    if (idx < 0)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("DEK version %u not found for table %u",
+                        key_version, table_oid)));
+    }
+
+    cached_table_oid = table_oid;
+    cached_key_version = key_version;
+    cached_idx = idx;
+    cached_key_count = global_key_mgr->key_count;
+
+    return global_key_mgr->keys[idx].dek;
+}
+
+/*
+ * Кэширует expanded key schedule Кузнечика для активного (table_oid, key_version).
+ * Это убирает дорогое kuz_set_key() на каждый кортеж в Seq Scan.
+ */
+static const kuz_key_t *
+opentde_get_cached_kuz_ctx(Oid table_oid, uint32_t key_version, const uint8_t *table_key)
+{
+    static bool      cache_valid = false;
+    static Oid       cached_table_oid = InvalidOid;
+    static uint32_t  cached_key_version = 0;
+    static uint8_t   cached_raw_key[DEK_SIZE];
+    static kuz_key_t cached_ctx;
+
+    if (cache_valid &&
+        cached_table_oid == table_oid &&
+        cached_key_version == key_version &&
+        memcmp(cached_raw_key, table_key, DEK_SIZE) == 0)
+        return &cached_ctx;
+
+    kuz_set_key(&cached_ctx, table_key);
+    memcpy(cached_raw_key, table_key, DEK_SIZE);
+    cached_table_oid = table_oid;
+    cached_key_version = key_version;
+    cache_valid = true;
+
+    return &cached_ctx;
+}
+
+/* Ищет активный DEK для таблицы; если активный флаг потерян, активирует max(version) */
 static int
 opentde_find_active_table_key_index(Oid table_oid)
 {
@@ -210,7 +241,7 @@ opentde_get_active_table_key_version(Oid table_oid)
     idx = opentde_find_active_table_key_index(table_oid);
     if (idx < 0)
     {
-        elog(LOG, "[OpenTDE] Creating initial DEK for table %u", table_oid);
+        elog(DEBUG1, "[OpenTDE] Creating initial DEK for table %u", table_oid);
         idx = opentde_create_initial_table_key(table_oid);
     }
 
@@ -246,13 +277,7 @@ opentde_get_table_dek_by_version(Oid table_oid, uint32_t key_version)
 }
 
 /*
- * Получение DEK для таблицы по её OID.
- *
- * Если DEK уже существует в менеджере ключей — возвращает копию.
- * Если нет — генерирует новый случайный DEK, оборачивает мастер-ключом,
- * сохраняет в менеджер и на диск, возвращает копию.
- *
- * Возвращённый указатель должен быть освобождён вызывающей стороной (pfree).
+ * Получение DEK для таблицы по её OID
  */
 uint8_t *
 opentde_get_table_dek(Oid table_oid)
@@ -321,32 +346,29 @@ opentde_rotate_table_dek(Oid table_oid)
     global_key_mgr->key_count++;
     opentde_save_key_file();
 
-    elog(LOG,
+    elog(DEBUG1,
          "[OpenTDE] Rotated DEK for table %u: new version %u",
          table_oid, new_version);
 
     return new_version;
 }
 
-/* =====================================================================
- * Шифрование / дешифрование данных
- * ===================================================================== */
-
 /*
  * Шифрование (или дешифрование) блока данных шифром «Кузнечик» в режиме CTR.
- * Операция симметрична: повторное применение расшифровывает данные.
+ * Операция симметрична
  *
  * data      — указатель на данные (шифруются in-place)
  * len       — длина данных в байтах
- * table_oid — OID таблицы (для получения правильного DEK)
- * key_version — версия DEK (0 = активная версия таблицы)
- * iv        — вектор инициализации (128 бит)
+ * table_oid — OID таблицы
+ * key_version — версия DEK
+ * iv        — вектор инициализации
  */
 void
 opentde_gost_encrypt_decrypt(char *data, int len, Oid table_oid,
                              uint32_t key_version, const uint8_t *iv)
 {
-    uint8_t *table_key;
+    const uint8_t *table_key;
+    const kuz_key_t *kuz_ctx;
 
     if (len <= 0)
         return;
@@ -354,28 +376,13 @@ opentde_gost_encrypt_decrypt(char *data, int len, Oid table_oid,
     if (key_version == 0)
         key_version = opentde_get_active_table_key_version(table_oid);
 
-    table_key = opentde_get_table_dek_by_version(table_oid, key_version);
-    kuz_ctr_crypt(table_key, iv, (uint8_t *) data, (size_t) len);
-    pfree(table_key);
+    table_key = opentde_get_table_dek_ptr_by_version(table_oid, key_version);
+    kuz_ctx = opentde_get_cached_kuz_ctx(table_oid, key_version, table_key);
+    kuz_ctr_crypt_ctx(kuz_ctx, iv, (uint8_t *) data, (size_t) len);
 }
 
-/* =====================================================================
- * Шифрование кортежа в памяти (перед записью в heap)
- * ===================================================================== */
-
 /*
- * Шифрование payload кортежа в памяти (in-place).
- *
- * Генерирует случайный 128-битный IV и шифрует всё после t_hoff
- * шифром «Кузнечик» CTR.  Кортеж модифицируется на месте — вызывающая
- * сторона должна передать записываемую (writable) копию.
- *
- * ВАЖНО: вызывается ДО heap_insert / heap_update / heap_multi_insert,
- * чтобы в WAL-журнал попадали уже зашифрованные данные.
- *
- * iv_out — выходной буфер для IV (DATA_IV_SIZE байт).
- * key_version_out — версия DEK, которой зашифрован кортеж.
- * Возвращает длину зашифрованного payload (0 если нечего шифровать).
+ * Шифрование payload кортежа в памяти
  */
 int
 opentde_encrypt_tuple_inplace(HeapTuple tuple, Oid table_oid,

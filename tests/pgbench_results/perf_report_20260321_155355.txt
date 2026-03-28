@@ -1,0 +1,36 @@
+============================================================================
+OpenTDE Performance Report
+============================================================================
+Generated: Сб 21 мар 2026 15:54:07 MSK
+Database:  postgres
+Clients:   1
+Threads:   1
+Duration:  10s
+
+Table Sizes:
+  t_encrypted: 88 kB
+  t_plain:     88 kB
+============================================================================
+
+═══════════════════════════════════════════════════════════════════════════
+Test: Read-Only (СЕЛЕКТы (точечные чтения))
+═══════════════════════════════════════════════════════════════════════════
+
+ENCRYPTED TABLE:
+pgbench: error: connection to server on socket "/tmp/.s.PGSQL.5432" failed: FATAL:  the database system is in recovery mode
+
+PLAIN TABLE:
+latency average = 0.688 ms
+tps = 1454.288931 (without initial connection time)
+pgbench: error: Run was aborted; the above results are incomplete.
+
+═══════════════════════════════════════════════════════════════════════════
+Test: Write (INSERT)
+═══════════════════════════════════════════════════════════════════════════
+
+ENCRYPTED TABLE:
+pgbench: error: connection to server on socket "/tmp/.s.PGSQL.5432" failed: FATAL:  the database system is in recovery mode
+
+PLAIN TABLE:
+pgbench: error: connection to server on socket "/tmp/.s.PGSQL.5432" failed: FATAL:  the database system is in recovery mode
+

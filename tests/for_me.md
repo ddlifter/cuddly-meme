@@ -7,7 +7,7 @@ SELECT opentde_set_master_key(decode('00112233445566778899aabbccddeeff0011223344
 CREATE TABLE t_test (
   id   int,
   name text
-) USING opentde;
+) USING opentde_page;
 
 CREATE TABLE t_plain (
   id   int,

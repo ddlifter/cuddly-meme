@@ -1,0 +1,39 @@
+============================================================================
+OpenTDE Performance Report
+============================================================================
+Generated: Сб 21 мар 2026 15:57:29 MSK
+Database:  postgres
+Clients:   1
+Threads:   1
+Duration:  10s
+
+Table Sizes:
+  t_encrypted: 88 kB
+  t_plain:     88 kB
+============================================================================
+
+═══════════════════════════════════════════════════════════════════════════
+Test: Read-Only (СЕЛЕКТы (точечные чтения))
+═══════════════════════════════════════════════════════════════════════════
+
+ENCRYPTED TABLE:
+latency average = 784.315 ms
+tps = 1.274999 (without initial connection time)
+
+PLAIN TABLE:
+latency average = 0.509 ms
+tps = 1965.275891 (without initial connection time)
+
+═══════════════════════════════════════════════════════════════════════════
+Test: Write (INSERT)
+═══════════════════════════════════════════════════════════════════════════
+
+ENCRYPTED TABLE:
+latency average = 72.375 ms
+tps = 13.816913 (without initial connection time)
+pgbench: error: Run was aborted; the above results are incomplete.
+
+PLAIN TABLE:
+latency average = 2.412 ms
+tps = 414.547413 (without initial connection time)
+

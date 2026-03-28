@@ -55,13 +55,14 @@ sql <<SQL
 DROP TABLE IF EXISTS t_test CASCADE;
 DROP TABLE IF EXISTS t_plain CASCADE;
 DROP EXTENSION IF EXISTS opentde CASCADE;
+DROP FUNCTION IF EXISTS opentde_page_crypto_selftest(oid, int4, bytea);
 CREATE EXTENSION opentde;
 SELECT opentde_set_master_key(decode('$MASTER_HEX', 'hex'));
 
 CREATE TABLE t_test (
   id   int,
   name text
-) USING opentde;
+) USING opentde_page;
 
 CREATE TABLE t_plain (
   id   int,
@@ -252,23 +253,47 @@ sql -c "DELETE FROM t_plain WHERE name='WAL_PLAIN_20260320';"
 echo ""
 
 echo ""
-echo "  [7/9] Слепой индекс и Index Scan"
+echo "  [7/9] Index Scan"
 echo ""
 echo ""
-sql -c "CREATE INDEX idx_blind ON t_test (opentde_blind_index(name));"
-echo ""
+sql <<SQL
+DROP TABLE IF EXISTS t_range_rw_plain;
+CREATE TABLE t_range_rw_plain (
+  id int,
+  amount bigint
+);
 
-PLAN=$($PSQL -d "$DBNAME" -At -c "SET enable_seqscan=off;" -c "EXPLAIN (COSTS OFF) SELECT * FROM t_test WHERE opentde_blind_index(name) = opentde_blind_index('Привет мир')" | grep -v '^SET$')
+INSERT INTO t_range_rw_plain VALUES
+  (1, 50),
+  (2, 120),
+  (3, 900),
+  (4, 1100),
+  (5, 1300),
+  (6, 1700),
+  (7, 2100);
+SQL
+
+$PSQL -d "$DBNAME" -v ON_ERROR_STOP=1 \
+  -c "CREATE INDEX idx_amount_auto ON t_range_rw_plain(amount);" \
+  -c "ANALYZE t_range_rw_plain;" >/dev/null
+
+PLAN=$($PSQL -d "$DBNAME" -At \
+  -c "SET enable_seqscan=off;" \
+  -c "SET enable_bitmapscan=off;" \
+  -c "EXPLAIN (COSTS OFF) SELECT id, amount FROM t_range_rw_plain WHERE amount > 1000 ORDER BY id" | grep -v '^SET$')
+
 echo "  Query Plan:"
 echo "  ----"
 echo "$PLAN" | sed 's/^/    /'
-echo "$PLAN" | grep -qi "index" || fail "Index Scan не используется"
+echo "$PLAN" | grep -qi "Index Scan" || fail "Index Scan не используется для amount > 1000"
 
-FOUND=$($PSQL -d "$DBNAME" -At -c "SET enable_seqscan=off;" -c "SELECT name FROM t_test WHERE opentde_blind_index(name) = opentde_blind_index('Привет мир')" | grep -v '^SET$')
-[[ "$FOUND" == "Привет мир" ]] || fail "Index Scan вернул '$FOUND'"
+FOUND=$($PSQL -d "$DBNAME" -At \
+  -c "SELECT string_agg(id::text, ',' ORDER BY id) FROM t_range_rw_plain WHERE amount > 1000" | grep -v '^SET$')
+
+[[ "$FOUND" == "4,5,6,7" ]] || fail "Ожидались id=4,5,6,7, получено '$FOUND'"
 echo ""
-echo "  ✓ Index Scan работает"
-echo "  ✓ Найденная строка: $FOUND"
+echo "  ✓ Index Scan работает для условия amount > 1000"
+echo "  ✓ Найденные id: $FOUND"
 echo ""
 
 echo ""

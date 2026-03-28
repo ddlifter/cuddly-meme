@@ -1,0 +1,38 @@
+============================================================================
+OpenTDE Performance Report
+============================================================================
+Generated: Сб 21 мар 2026 15:59:23 MSK
+Database:  postgres
+Clients:   1
+Threads:   1
+Duration:  3s
+
+Table Sizes:
+  t_encrypted: 88 kB
+  t_plain:     88 kB
+============================================================================
+
+═══════════════════════════════════════════════════════════════════════════
+Test: Read-Only (СЕЛЕКТы (точечные чтения))
+═══════════════════════════════════════════════════════════════════════════
+
+ENCRYPTED TABLE:
+latency average = 739.798 ms
+tps = 1.351721 (without initial connection time)
+
+PLAIN TABLE:
+latency average = 0.552 ms
+tps = 1810.924409 (without initial connection time)
+
+═══════════════════════════════════════════════════════════════════════════
+Test: Write (INSERT)
+═══════════════════════════════════════════════════════════════════════════
+
+ENCRYPTED TABLE:
+latency average = 42.544 ms
+tps = 23.505311 (without initial connection time)
+
+PLAIN TABLE:
+latency average = 1.766 ms
+tps = 566.323602 (without initial connection time)
+
