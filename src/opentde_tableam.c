@@ -99,7 +99,6 @@ opentde_decrypt_slot(Oid table_oid, TupleTableSlot *slot)
 {
     bool            should_free;
     HeapTuple       tuple;
-    HeapTuple       decrypted;
     char           *payload;
     int             payload_len;
     uint8_t         row_iv[DATA_IV_SIZE];
@@ -112,33 +111,49 @@ opentde_decrypt_slot(Oid table_oid, TupleTableSlot *slot)
     if (!tuple)
         return;
 
-    /* Рабочая копия — оригинал может указывать в буферную страницу */
-    decrypted = heap_copytuple(tuple);
-    decrypted->t_self = tuple->t_self;
-
-    payload     = (char *) decrypted->t_data + decrypted->t_data->t_hoff;
-    payload_len = decrypted->t_len - decrypted->t_data->t_hoff;
-
-    if (payload_len > 0)
-    {
-        if (!opentde_lookup_tuple_iv(table_oid, &decrypted->t_self,
-                         row_iv, &row_key_version))
-            ereport(ERROR,
-                    (errcode(ERRCODE_INTERNAL_ERROR),
-                     errmsg("missing tuple IV for table %u block %u offset %u",
-                            table_oid,
-                            ItemPointerGetBlockNumber(&decrypted->t_self),
-                            ItemPointerGetOffsetNumber(&decrypted->t_self))));
-
-        opentde_gost_encrypt_decrypt(payload, payload_len,
-                         table_oid, row_key_version, row_iv);
-    }
-
-    ExecForceStoreHeapTuple(decrypted, slot, true);
-    slot->tts_tid = saved_tid;
-
-    if (should_free)
+    // Если tuple не указывает в буферную страницу, можно дешифровать in-place
+    if (should_free) {
+        payload     = (char *) tuple->t_data + tuple->t_data->t_hoff;
+        payload_len = tuple->t_len - tuple->t_data->t_hoff;
+        if (payload_len > 0)
+        {
+            if (!opentde_lookup_tuple_iv(table_oid, &tuple->t_self,
+                             row_iv, &row_key_version))
+                ereport(ERROR,
+                        (errcode(ERRCODE_INTERNAL_ERROR),
+                         errmsg("missing tuple IV for table %u block %u offset %u",
+                                table_oid,
+                                ItemPointerGetBlockNumber(&tuple->t_self),
+                                ItemPointerGetOffsetNumber(&tuple->t_self))));
+            opentde_gost_encrypt_decrypt(payload, payload_len,
+                             table_oid, row_key_version, row_iv);
+        }
+        ExecForceStoreHeapTuple(tuple, slot, true);
+        slot->tts_tid = saved_tid;
         heap_freetuple(tuple);
+    } else {
+        // Оригинальный случай: копируем tuple, чтобы не портить буфер
+        HeapTuple decrypted = heap_copytuple(tuple);
+        decrypted->t_self = tuple->t_self;
+        payload     = (char *) decrypted->t_data + decrypted->t_data->t_hoff;
+        payload_len = decrypted->t_len - decrypted->t_data->t_hoff;
+        if (payload_len > 0)
+        {
+            if (!opentde_lookup_tuple_iv(table_oid, &decrypted->t_self,
+                             row_iv, &row_key_version))
+                ereport(ERROR,
+                        (errcode(ERRCODE_INTERNAL_ERROR),
+                         errmsg("missing tuple IV for table %u block %u offset %u",
+                                table_oid,
+                                ItemPointerGetBlockNumber(&decrypted->t_self),
+                                ItemPointerGetOffsetNumber(&decrypted->t_self))));
+            opentde_gost_encrypt_decrypt(payload, payload_len,
+                             table_oid, row_key_version, row_iv);
+        }
+        ExecForceStoreHeapTuple(decrypted, slot, true);
+        slot->tts_tid = saved_tid;
+        heap_freetuple(decrypted);
+    }
 }
 
 /* =====================================================================
@@ -267,54 +282,41 @@ opentde_multi_insert(Relation relation,
                      int options,
                      BulkInsertState bistate)
 {
-    Oid      table_oid;
+    Oid      table_oid = RelationGetRelid(relation);
     int      i;
-    uint8_t (*ivs)[DATA_IV_SIZE];
-    uint32_t *key_versions;
+    uint8_t (*ivs)[DATA_IV_SIZE] = palloc(nslots * sizeof(*ivs));
+    uint32_t *key_versions = palloc0(nslots * sizeof(*key_versions));
 
-    table_oid = RelationGetRelid(relation);
-
-    /* Массив IV — по одному на каждый кортеж */
-    ivs = palloc(nslots * sizeof(*ivs));
-    key_versions = palloc0(nslots * sizeof(*key_versions));
-
-    /*
-     * Шифруем каждый кортеж ДО массовой вставки.
-     * Получаем HeapTuple из слота, шифруем payload,
-     * кладём зашифрованный кортеж обратно в слот.
-     */
+    // Batch-шифрование: минимизируем overhead
+    /* Параллельное шифрование пачки tuple (OpenMP) */
+#pragma omp parallel for schedule(static)
     for (i = 0; i < nslots; i++)
     {
         bool      should_free;
-        HeapTuple tuple;
-        HeapTuple encrypted;
-
-        tuple = ExecFetchSlotHeapTuple(slots[i], true, &should_free);
+        HeapTuple tuple = ExecFetchSlotHeapTuple(slots[i], true, &should_free);
         if (!tuple)
         {
             memset(ivs[i], 0, DATA_IV_SIZE);
             key_versions[i] = 0;
             continue;
         }
-
-        encrypted = heap_copytuple(tuple);
-        opentde_encrypt_tuple_inplace(encrypted, table_oid,
-                                      ivs[i], &key_versions[i]);
-        ExecForceStoreHeapTuple(encrypted, slots[i], true);
-
-        if (should_free)
+        if (should_free) {
+            opentde_encrypt_tuple_inplace(tuple, table_oid, ivs[i], &key_versions[i]);
+            ExecForceStoreHeapTuple(tuple, slots[i], true);
             heap_freetuple(tuple);
+        } else {
+            HeapTuple encrypted = heap_copytuple(tuple);
+            opentde_encrypt_tuple_inplace(encrypted, table_oid, ivs[i], &key_versions[i]);
+            ExecForceStoreHeapTuple(encrypted, slots[i], true);
+        }
     }
 
-    /* Массовая вставка зашифрованных кортежей */
     heap_multi_insert(relation, slots, nslots, cid, options, bistate);
 
-    /* Регистрация IV для каждого назначенного TID */
     for (i = 0; i < nslots; i++)
     {
         if (ItemPointerIsValid(&slots[i]->tts_tid) && key_versions[i] != 0)
-            opentde_register_tuple_iv(table_oid, &slots[i]->tts_tid,
-                                      ivs[i], key_versions[i]);
+            opentde_register_tuple_iv(table_oid, &slots[i]->tts_tid, ivs[i], key_versions[i]);
     }
 
     pfree(key_versions);

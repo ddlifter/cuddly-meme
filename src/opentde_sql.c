@@ -1,3 +1,14 @@
+#include "opentde.h"
+
+PG_FUNCTION_INFO_V1(set_column_level_encryption);
+
+Datum
+set_column_level_encryption(PG_FUNCTION_ARGS)
+{
+    bool enable = PG_GETARG_BOOL(0);
+    use_column_level_encryption = enable;
+    PG_RETURN_VOID();
+}
 /*
  * opentde_sql.c — SQL-функции расширения OpenTDE.
  *

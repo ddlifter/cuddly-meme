@@ -1,3 +1,43 @@
+#include <stdbool.h>
+#include "opentde.h"
+#include "postgres.h"
+#include "access/htup_details.h"
+#include "access/heapam.h"
+#include <stdint.h>
+
+// Глобальный флаг: использовать column-level encryption (альтернатива)
+bool use_column_level_encryption = false;
+
+// Пример: шифровать только первый user-атрибут (offset = t_hoff, длина = 4)
+int opentde_encrypt_tuple_inplace_column(HeapTuple tuple, Oid table_oid,
+                              uint8_t *iv_out,
+                              uint32_t *key_version_out)
+{
+    char     *payload;
+    int       payload_len;
+    uint32_t  key_version;
+
+    payload     = (char *) tuple->t_data + tuple->t_data->t_hoff;
+    payload_len = tuple->t_len - tuple->t_data->t_hoff;
+
+    if (payload_len < 4) // нет первого user-атрибута
+    {
+        if (key_version_out)
+            *key_version_out = 0;
+        return 0;
+    }
+
+    key_version = opentde_get_active_table_key_version(table_oid);
+
+    opentde_fill_random_bytes(iv_out, DATA_IV_SIZE, "tuple payload IV");
+    // Шифруем только первые 4 байта payload (пример: первый int-столбец)
+    opentde_gost_encrypt_decrypt(payload, 4, table_oid, key_version, iv_out);
+
+    if (key_version_out)
+        *key_version_out = key_version;
+
+    return 4;
+}
 /*
  * opentde_crypto.c — Криптографический модуль OpenTDE.
  *
@@ -218,19 +258,17 @@ opentde_get_active_table_key_version(Oid table_oid)
 }
 
 /* Возвращает копию DEK указанной версии для таблицы. */
-uint8_t *
-opentde_get_table_dek_by_version(Oid table_oid, uint32_t key_version)
-{
-    uint8_t *result_dek;
-    int      idx;
 
+opentde_key_entry *
+opentde_get_table_key_entry_by_version(Oid table_oid, uint32_t key_version)
+{
+    int idx;
     if (!master_key_set || !global_key_mgr)
     {
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("master key not set")));
     }
-
     idx = opentde_find_table_key_index(table_oid, key_version);
     if (idx < 0)
     {
@@ -239,10 +277,7 @@ opentde_get_table_dek_by_version(Oid table_oid, uint32_t key_version)
                  errmsg("DEK version %u not found for table %u",
                         key_version, table_oid)));
     }
-
-    result_dek = palloc(DEK_SIZE);
-    memcpy(result_dek, global_key_mgr->keys[idx].dek, DEK_SIZE);
-    return result_dek;
+    return &global_key_mgr->keys[idx];
 }
 
 /*
@@ -260,7 +295,7 @@ opentde_get_table_dek(Oid table_oid)
     uint32_t key_version;
 
     key_version = opentde_get_active_table_key_version(table_oid);
-    return opentde_get_table_dek_by_version(table_oid, key_version);
+    return (uint8_t *)opentde_get_table_key_entry_by_version(table_oid, key_version);
 }
 
 /*
@@ -354,9 +389,12 @@ opentde_gost_encrypt_decrypt(char *data, int len, Oid table_oid,
     if (key_version == 0)
         key_version = opentde_get_active_table_key_version(table_oid);
 
-    table_key = opentde_get_table_dek_by_version(table_oid, key_version);
-    kuz_ctr_crypt(table_key, iv, (uint8_t *) data, (size_t) len);
-    pfree(table_key);
+    opentde_key_entry *key_entry = opentde_get_table_key_entry_by_version(table_oid, key_version);
+    if (!key_entry->round_keys_ready) {
+        kuz_set_key(&key_entry->round_keys, key_entry->dek);
+        key_entry->round_keys_ready = true;
+    }
+    kuz_ctr_crypt(&key_entry->round_keys, iv, (uint8_t *) data, (size_t) len);
 }
 
 /* =====================================================================
@@ -382,6 +420,9 @@ opentde_encrypt_tuple_inplace(HeapTuple tuple, Oid table_oid,
                               uint8_t *iv_out,
                               uint32_t *key_version_out)
 {
+    if (use_column_level_encryption)
+        return opentde_encrypt_tuple_inplace_column(tuple, table_oid, iv_out, key_version_out);
+
     char     *payload;
     int       payload_len;
     uint32_t  key_version;
@@ -389,7 +430,9 @@ opentde_encrypt_tuple_inplace(HeapTuple tuple, Oid table_oid,
     payload     = (char *) tuple->t_data + tuple->t_data->t_hoff;
     payload_len = tuple->t_len - tuple->t_data->t_hoff;
 
-    if (payload_len <= 0)
+    // Не шифруем первые N байт user-данных (например, если они не чувствительны)
+    int skip_bytes = 0; // Можно сделать параметром или макросом
+    if (payload_len <= skip_bytes)
     {
         if (key_version_out)
             *key_version_out = 0;
@@ -399,10 +442,10 @@ opentde_encrypt_tuple_inplace(HeapTuple tuple, Oid table_oid,
     key_version = opentde_get_active_table_key_version(table_oid);
 
     opentde_fill_random_bytes(iv_out, DATA_IV_SIZE, "tuple payload IV");
-    opentde_gost_encrypt_decrypt(payload, payload_len, table_oid, key_version, iv_out);
+    opentde_gost_encrypt_decrypt(payload + skip_bytes, payload_len - skip_bytes, table_oid, key_version, iv_out);
 
     if (key_version_out)
         *key_version_out = key_version;
 
-    return payload_len;
+    return payload_len - skip_bytes;
 }

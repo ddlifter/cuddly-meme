@@ -1,3 +1,4 @@
+#include <emmintrin.h> // SSE2
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -57,9 +58,13 @@ static void L(const uint8_t *in, uint8_t *out) {
         148, 32, 133, 16, 194, 192, 1, 251, 1, 192, 194, 16, 133, 32, 148, 1
     };
     
-    uint8_t temp[16];
+    uint8_t temp[16] __attribute__((aligned(16)));
+#ifdef __SSE2__
+    __m128i vin = _mm_loadu_si128((const __m128i*)in);
+    _mm_storeu_si128((__m128i*)temp, vin);
+#else
     memcpy(temp, in, 16);
-    
+#endif
     for(int i = 0; i < 16; i++) {
         uint8_t a15 = 0;
         for(int j = 0; j < 16; j++) {
@@ -68,7 +73,11 @@ static void L(const uint8_t *in, uint8_t *out) {
         memmove(temp + 1, temp, 15);
         temp[0] = a15;  // Циклический сдвиг + L
     }
+#ifdef __SSE2__
+    _mm_storeu_si128((__m128i*)out, _mm_loadu_si128((__m128i*)temp));
+#else
     memcpy(out, temp, 16);
+#endif
 }
 
 // S-преобразование (подстановка)
@@ -78,12 +87,16 @@ static void S(const uint8_t *in, uint8_t *out) {
 
 // LSX = L ◦ S ◦ X (XOR с ключом)
 static void LSX(const uint8_t *key, uint8_t *state) {
-    uint8_t temp[16];
-    // X: state ^= key
+    uint8_t temp[16] __attribute__((aligned(16)));
+#ifdef __SSE2__
+    __m128i vstate = _mm_loadu_si128((const __m128i*)state);
+    __m128i vkey = _mm_loadu_si128((const __m128i*)key);
+    __m128i vxor = _mm_xor_si128(vstate, vkey);
+    _mm_storeu_si128((__m128i*)temp, vxor);
+#else
     for(int i = 0; i < 16; i++) temp[i] = state[i] ^ key[i];
-    // S
+#endif
     S(temp, temp);
-    // L
     L(temp, state);
 }
 
@@ -122,24 +135,20 @@ void kuz_encrypt_block(kuz_key_t *ctx, const uint8_t *in, uint8_t *out) {
 }
 
 // ✅ CTR режим для DEK (32 байта)
-void kuz_ctr_crypt(const uint8_t *key, const uint8_t *iv, uint8_t *data, size_t len) {
-    kuz_key_t ctx;
-    kuz_set_key(&ctx, key);
-    
+void kuz_ctr_crypt(const kuz_key_t *round_keys, const uint8_t *iv, uint8_t *data, size_t len) {
+    // TODO: SIMD-оптимизация (SSE/AVX) для kuz_encrypt_block и гаммирования
+    const kuz_key_t *ctx = round_keys;
     uint8_t ctr[16];
     uint8_t gamma[16];
     memcpy(ctr, iv, 16);
-    
     size_t processed = 0;
     while(processed < len) {
-        kuz_encrypt_block(&ctx, ctr, gamma);
-        
+        kuz_encrypt_block((kuz_key_t *)ctx, ctr, gamma);
         // Инкремент счетчика (big-endian)
         for(int i = 15; i >= 0; i--) {
             ctr[i]++;
             if(ctr[i] != 0) break;
         }
-        
         size_t chunk = (len - processed < 16) ? (len - processed) : 16;
         for(size_t i = 0; i < chunk; i++) {
             data[processed + i] ^= gamma[i];  // CTR: data ^= keystream

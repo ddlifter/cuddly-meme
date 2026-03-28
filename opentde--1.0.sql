@@ -1,3 +1,9 @@
+
+-- Включение/выключение column-level encryption
+CREATE OR REPLACE FUNCTION set_column_level_encryption(enable boolean)
+RETURNS void
+AS 'MODULE_PATHNAME', 'set_column_level_encryption'
+LANGUAGE C STRICT;
 /* opentde--1.0.sql */
 
 \echo Use "CREATE EXTENSION opentde" to load this file. \quit

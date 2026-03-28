@@ -1,3 +1,40 @@
+#include <stdint.h>
+#include <stdbool.h>
+#include "postgres.h"
+#include "access/htup_details.h"
+#include "access/heapam.h"
+#include "opentde.h"
+#define IV_BLOCK_CACHE_SIZE 64
+typedef struct {
+    Oid table_oid;
+    BlockNumber block;
+    uint32_t key_version;
+    uint8_t iv[DATA_IV_SIZE];
+    bool valid;
+} iv_block_cache_entry;
+static iv_block_cache_entry iv_block_cache[IV_BLOCK_CACHE_SIZE];
+static int iv_block_cache_pos = 0;
+
+static bool lookup_iv_block_cache(Oid table_oid, BlockNumber block, uint8_t *iv, uint32_t *key_version) {
+    for (int i = 0; i < IV_BLOCK_CACHE_SIZE; i++) {
+        if (iv_block_cache[i].valid &&
+            iv_block_cache[i].table_oid == table_oid &&
+            iv_block_cache[i].block == block) {
+            memcpy(iv, iv_block_cache[i].iv, DATA_IV_SIZE);
+            *key_version = iv_block_cache[i].key_version;
+            return true;
+        }
+    }
+    return false;
+}
+static void insert_iv_block_cache(Oid table_oid, BlockNumber block, const uint8_t *iv, uint32_t key_version) {
+    iv_block_cache[iv_block_cache_pos].table_oid = table_oid;
+    iv_block_cache[iv_block_cache_pos].block = block;
+    iv_block_cache[iv_block_cache_pos].key_version = key_version;
+    memcpy(iv_block_cache[iv_block_cache_pos].iv, iv, DATA_IV_SIZE);
+    iv_block_cache[iv_block_cache_pos].valid = true;
+    iv_block_cache_pos = (iv_block_cache_pos + 1) % IV_BLOCK_CACHE_SIZE;
+}
 /*
  * opentde_keymanager.c — Модуль управления ключами OpenTDE.
  *
@@ -646,6 +683,8 @@ opentde_load_key_file(void)
             {
                 continue;
             }
+            kuz_set_key(&dst->round_keys, dst->dek);
+            dst->round_keys_ready = true;
         }
         else
         {
@@ -665,6 +704,8 @@ opentde_load_key_file(void)
             {
                 continue;
             }
+            kuz_set_key(&dst->round_keys, dst->dek);
+            dst->round_keys_ready = true;
         }
 
         global_key_mgr->key_count++;
@@ -1008,22 +1049,25 @@ opentde_lookup_tuple_iv(Oid table_oid, const ItemPointer tid,
     block  = ItemPointerGetBlockNumber(tid);
     offset = ItemPointerGetOffsetNumber(tid);
 
-    /* Обратный обход — последняя запись наиболее актуальна */
+    // Кэш на блок
+    if (key_version_out && lookup_iv_block_cache(table_oid, block, iv_out, key_version_out))
+        return true;
+
     for (i = global_key_mgr->iv_count - 1; i >= 0; i--)
     {
         opentde_iv_entry *entry = &global_key_mgr->ivs[i];
-
         if (entry->table_oid == table_oid &&
             entry->block == block &&
             entry->offset == offset)
         {
             memcpy(iv_out, entry->iv, DATA_IV_SIZE);
+            uint32_t ver = entry->key_version == 0 ? DEFAULT_DEK_VERSION : entry->key_version;
             if (key_version_out)
-                *key_version_out = entry->key_version == 0 ? DEFAULT_DEK_VERSION : entry->key_version;
+                *key_version_out = ver;
+            insert_iv_block_cache(table_oid, block, entry->iv, ver);
             return true;
         }
     }
-
     return false;
 }
 

@@ -18,6 +18,6 @@ void kuz_set_key(kuz_key_t *ctx, const uint8_t *key);
 // out = Encrypt(in)
 void kuz_encrypt_block(kuz_key_t *ctx, const uint8_t *in, uint8_t *out);
 
-void kuz_ctr_crypt(const uint8_t *key, const uint8_t *iv, uint8_t *data, size_t len);
+void kuz_ctr_crypt(const kuz_key_t *round_keys, const uint8_t *iv, uint8_t *data, size_t len);
 
 #endif
