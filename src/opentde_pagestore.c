@@ -1,5 +1,6 @@
 
 #include "postgres.h"
+#include "access/htup_details.h"
 #include <stdbool.h>
 #define OPENTDE_PAGESTORE_MAGIC 0x50414745 /* 'PAGE' */
 #define OPENTDE_PAGESTORE_VERSION 1
@@ -85,12 +86,93 @@ static void opentde_pagestore_ensure_dir(void)
 static void opentde_pagestore_lock_fd(int fd, int locktype) { /* stub */ }
 static void opentde_pagestore_unlock_fd(int fd) { /* stub */ }
 static void opentde_pagestore_write_journal(Oid table_oid, uint32_t blockno, uint8_t *blob, uint32_t blob_len) { /* stub */ }
-static void opentde_pagestore_append_raw_record(int fd, uint32_t blockno, uint8_t *blob, uint32_t blob_len) { /* stub */ }
+static void opentde_pagestore_append_raw_record(int fd, uint32_t blockno, uint8_t *blob, uint32_t blob_len)
+{
+    opentde_pagestore_record_header rec_hdr;
+    off_t end_off;
+    ssize_t written;
+
+    // Seek to end of file
+    end_off = lseek(fd, 0, SEEK_END);
+    elog(LOG, "OpenTDE: append_raw_record: seek to end, offset=%ld", (long)end_off);
+    if (end_off == (off_t)-1)
+    {
+        elog(WARNING, "OpenTDE: append_raw_record: lseek failed");
+        return;
+    }
+
+    // Write record header
+    rec_hdr.blockno = blockno;
+    rec_hdr.blob_len = blob_len;
+    elog(LOG, "OpenTDE: append_raw_record: writing header at offset=%ld blockno=%u blob_len=%u", (long)end_off, blockno, blob_len);
+    written = write(fd, &rec_hdr, sizeof(rec_hdr));
+    if (written != sizeof(rec_hdr))
+    {
+        elog(WARNING, "OpenTDE: append_raw_record: failed to write record header");
+        return;
+    }
+    end_off += sizeof(rec_hdr);
+
+    // Write blob if present
+    if (blob_len > 0 && blob != NULL)
+    {
+        elog(LOG, "OpenTDE: append_raw_record: writing blob at offset=%ld len=%u", (long)end_off, blob_len);
+        written = write(fd, blob, blob_len);
+        if (written != (ssize_t)blob_len)
+        {
+            elog(WARNING, "OpenTDE: append_raw_record: failed to write blob");
+            return;
+        }
+        end_off += blob_len;
+    }
+    elog(LOG, "OpenTDE: append_raw_record: done, new offset=%ld", (long)end_off);
+    // Optionally fsync here if needed (already done by caller)
+}
 static void opentde_pagestore_fsync_fd(int fd, const char *desc) { /* stub */ }
 static void opentde_pagestore_clear_journal(Oid table_oid) { /* stub */ }
 static void opentde_pagestore_replay_journal_if_needed(int fd, Oid table_oid, opentde_pagestore_header *hdr) { /* stub */ }
-static int opentde_page_blob_encrypt(Oid table_oid, BlockNumber blockno, uint8_t *plain, uint32_t plain_len, uint8_t **blob_out, uint32_t *blob_len_out) { return 1; }
-static int opentde_page_blob_decrypt(Oid table_oid, BlockNumber blockno, uint8_t *blob, uint32_t blob_len, uint8_t **plain_out, uint32_t *plain_len_out, void *unused) { return 1; }
+static int opentde_page_blob_encrypt(Oid table_oid, BlockNumber blockno, uint8_t *plain, uint32_t plain_len, uint8_t **blob_out, uint32_t *blob_len_out)
+{
+    elog(LOG, "OpenTDE: page_blob_encrypt (real): table_oid=%u blockno=%u plain_len=%u", table_oid, blockno, plain_len);
+    if (!plain || plain_len == 0 || !blob_out || !blob_len_out) {
+        elog(LOG, "OpenTDE: page_blob_encrypt: invalid input, returning 0");
+        return 0;
+    }
+    /* Получаем DEK и генерируем IV */
+    uint8_t *dek = opentde_get_table_dek(table_oid);
+    uint8_t iv[DATA_IV_SIZE];
+    opentde_fill_random_bytes(iv, DATA_IV_SIZE, "pagestore_encrypt");
+    *blob_out = (uint8_t *) palloc(plain_len);
+    memcpy(*blob_out, plain, plain_len);
+    opentde_gost_encrypt_decrypt((char *)*blob_out, plain_len, table_oid, DEFAULT_DEK_VERSION, iv);
+    *blob_len_out = plain_len;
+    /* Сохраняем IV для этого блока (или tuple) */
+    ItemPointerData fake_tid;
+    ItemPointerSet(&fake_tid, blockno, 1); /* offset=1: для page-level, иначе нужен tid */
+    opentde_register_tuple_iv(table_oid, &fake_tid, iv, DEFAULT_DEK_VERSION);
+    elog(LOG, "OpenTDE: page_blob_encrypt: encrypted %u bytes", plain_len);
+    return 1;
+}
+static int opentde_page_blob_decrypt(Oid table_oid, BlockNumber blockno, uint8_t *blob, uint32_t blob_len, uint8_t **plain_out, uint32_t *plain_len_out, void *unused)
+{
+    if (!blob || blob_len == 0 || !plain_out || !plain_len_out)
+        return 0;
+    *plain_out = (uint8_t *) palloc(blob_len);
+    memcpy(*plain_out, blob, blob_len);
+    /* Получаем DEK и IV */
+    uint8_t *dek = opentde_get_table_dek(table_oid);
+    uint8_t iv[DATA_IV_SIZE];
+    uint32_t key_version = DEFAULT_DEK_VERSION;
+    ItemPointerData fake_tid;
+    ItemPointerSet(&fake_tid, blockno, 1);
+    if (!opentde_lookup_tuple_iv(table_oid, &fake_tid, iv, &key_version)) {
+        elog(WARNING, "OpenTDE: page_blob_decrypt: IV not found for table_oid=%u blockno=%u", table_oid, blockno);
+        memset(iv, 0, DATA_IV_SIZE);
+    }
+    opentde_gost_encrypt_decrypt((char *)*plain_out, blob_len, table_oid, key_version, iv);
+    *plain_len_out = blob_len;
+    return 1;
+}
 
 /* --- End static helpers --- */
 
@@ -151,12 +233,16 @@ opentde_pagestore_append_tuple_internal(Oid table_oid,
     uint32_t                     blob_len = 0;
     uint32_t                     stored_blockno;
 
+    elog(LOG, "OpenTDE: append_tuple_internal: table_oid=%u use_explicit_blockno=%d blockno=%u delete_marker=%d", table_oid, use_explicit_blockno, blockno, delete_marker);
+
     if (!delete_marker && (!tuple || tuple->t_len <= 0))
         return false;
 
     opentde_pagestore_ensure_dir();
     path = opentde_pagestore_get_file_path(table_oid);
 
+
+    /* Try to open file, create if missing, and initialize header if new */
     fd = open(path, O_RDWR | O_CREAT | PG_BINARY, 0600);
     if (fd < 0)
     {
@@ -168,9 +254,21 @@ opentde_pagestore_append_tuple_internal(Oid table_oid,
 
     opentde_pagestore_lock_fd(fd, F_WRLCK);
 
+    /* Check if file is new (size == 0), and initialize header if so */
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size == 0) {
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.magic = OPENTDE_PAGESTORE_MAGIC;
+        hdr.version = OPENTDE_PAGESTORE_VERSION;
+        hdr.record_count = 0;
+        pwrite(fd, &hdr, sizeof(hdr), 0);
+        elog(LOG, "OpenTDE: pagestore file created and header initialized for table_oid=%u", table_oid);
+    }
+
     opentde_pagestore_read_or_init_header(fd, &hdr);
     opentde_pagestore_replay_journal_if_needed(fd, table_oid, &hdr);
 
+    elog(LOG, "OpenTDE: append_tuple_internal: before write, record_count=%u", hdr.record_count);
     stored_blockno = use_explicit_blockno ? (uint32_t) blockno : hdr.record_count;
 
     if (!delete_marker)
@@ -181,12 +279,15 @@ opentde_pagestore_append_tuple_internal(Oid table_oid,
                    stored_blockno,
                    FirstOffsetNumber);
 
-        if (!opentde_page_blob_encrypt(table_oid,
+        elog(LOG, "OpenTDE: about to call page_blob_encrypt: t_len=%u", (uint32_t)tuple->t_len);
+        int enc_ret = opentde_page_blob_encrypt(table_oid,
                                        (BlockNumber) stored_blockno,
                                        plain_copy,
                                        (uint32_t) tuple->t_len,
                                        &blob,
-                                       &blob_len))
+                                       &blob_len);
+        elog(LOG, "OpenTDE: page_blob_encrypt returned %d, blob_len=%u", enc_ret, blob_len);
+        if (!enc_ret)
         {
             pfree(plain_copy);
             opentde_pagestore_unlock_fd(fd);
@@ -206,8 +307,10 @@ opentde_pagestore_append_tuple_internal(Oid table_oid,
     opentde_pagestore_append_raw_record(fd, stored_blockno, blob, blob_len);
     opentde_pagestore_fsync_fd(fd, "page store file");
 
-    if (stored_blockno >= hdr.record_count)
+    if (stored_blockno >= hdr.record_count) {
         hdr.record_count = stored_blockno + 1;
+        elog(LOG, "OpenTDE: append_tuple_internal: updated record_count=%u", hdr.record_count);
+    }
     opentde_pagestore_write_header(fd, &hdr);
     opentde_pagestore_fsync_fd(fd, "page store file header");
     opentde_pagestore_clear_journal(table_oid);
@@ -419,6 +522,8 @@ opentde_pagestore_scan_open(Oid table_oid, opentde_pagestore_scan *scan)
     opentde_pagestore_row_state *rows;
     opentde_pagestore_record_header rec_hdr;
 
+    elog(LOG, "OpenTDE: scan_open: table_oid=%u", table_oid);
+
     if (!scan)
         return false;
 
@@ -444,26 +549,32 @@ opentde_pagestore_scan_open(Oid table_oid, opentde_pagestore_scan *scan)
 
     max_blockno = 0;
     off = sizeof(opentde_pagestore_header);
+    uint32_t record_counter = 0;
     while (off + sizeof(rec_hdr) <= (uint64_t) st.st_size)
     {
+        elog(LOG, "OpenTDE: scan_open: reading header at offset=%lu", (unsigned long)off);
         if (pread(fd, &rec_hdr, sizeof(rec_hdr), (off_t) off) != sizeof(rec_hdr))
         {
+            elog(WARNING, "OpenTDE: scan_open: failed to read record header at offset=%lu", (unsigned long)off);
             close(fd);
             return false;
         }
+        elog(LOG, "OpenTDE: scan_open: got header blockno=%u blob_len=%u", rec_hdr.blockno, rec_hdr.blob_len);
 
         off += sizeof(rec_hdr);
         if (off + rec_hdr.blob_len > (uint64_t) st.st_size)
         {
+            elog(WARNING, "OpenTDE: scan_open: blob_len out of bounds at offset=%lu", (unsigned long)off);
             close(fd);
             return false;
         }
 
         if (rec_hdr.blockno > max_blockno)
             max_blockno = rec_hdr.blockno;
-
+        record_counter++;
         off += rec_hdr.blob_len;
     }
+    elog(LOG, "OpenTDE: scan_open: found %u records, max_blockno=%u", record_counter, max_blockno);
 
     rows = NULL;
     if (off > sizeof(opentde_pagestore_header))
@@ -515,9 +626,7 @@ opentde_pagestore_scan_open(Oid table_oid, opentde_pagestore_scan *scan)
     return true;
 }
 
-bool
-opentde_pagestore_scan_next(opentde_pagestore_scan *scan,
-                            HeapTuple *tuple_out)
+bool opentde_pagestore_scan_next(opentde_pagestore_scan *scan, HeapTuple *tuple_out)
 {
     opentde_pagestore_row_state    *rows;
     uint8_t                        *blob;
@@ -569,6 +678,12 @@ opentde_pagestore_scan_next(opentde_pagestore_scan *scan,
         tuple->t_tableOid = scan->table_oid;
         ItemPointerSet(&tuple->t_data->t_ctid, blockno, FirstOffsetNumber);
         ItemPointerSet(&tuple->t_self, blockno, FirstOffsetNumber);
+
+        /* Set tuple header fields for visibility */
+        HeapTupleHeaderSetXmin(tuple->t_data, 1); /* always visible */
+        HeapTupleHeaderSetCmin(tuple->t_data, 0);
+        HeapTupleHeaderSetXmax(tuple->t_data, 0);
+        tuple->t_data->t_infomask |= HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID;
 
         *tuple_out = tuple;
 

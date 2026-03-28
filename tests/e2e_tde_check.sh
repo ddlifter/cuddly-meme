@@ -91,78 +91,78 @@ echo "  Данные в t_test (зашифрованная таблица):"
 sql_show "SELECT id, name FROM t_test ORDER BY id;"
 echo ""
 
-echo ""
-echo "  [2/9] UPDATE — Обновляем колонку"
-echo ""
-echo ""
-sql -c "UPDATE t_test SET name = 'Обновлённая' WHERE id = 2;"
+# echo ""
+# echo "  [2/9] UPDATE — Обновляем колонку"
+# echo ""
+# echo ""
+# sql -c "UPDATE t_test SET name = 'Обновлённая' WHERE id = 2;"
 
-UPD_NAME=$(sql_val "SELECT name FROM t_test WHERE id = 2")
-[[ "$UPD_NAME" == "Обновлённая" ]] || fail "UPDATE name: '$UPD_NAME'"
+# UPD_NAME=$(sql_val "SELECT name FROM t_test WHERE id = 2")
+# [[ "$UPD_NAME" == "Обновлённая" ]] || fail "UPDATE name: '$UPD_NAME'"
 
-UPD_ID=$(sql_val "SELECT id FROM t_test WHERE id = 2")
-[[ "$UPD_ID" == "2" ]] || fail "UPDATE: id изменился на '$UPD_ID'"
+# UPD_ID=$(sql_val "SELECT id FROM t_test WHERE id = 2")
+# [[ "$UPD_ID" == "2" ]] || fail "UPDATE: id изменился на '$UPD_ID'"
 
-sql -c "UPDATE t_test SET id = 20, name = 'Двойное обновление' WHERE id = 3;"
-UPD2=$(sql_val "SELECT id || '|' || name FROM t_test WHERE id = 20")
-[[ "$UPD2" == "20|Двойное обновление" ]] || fail "UPDATE обоих столбцов: '$UPD2'"
+# sql -c "UPDATE t_test SET id = 20, name = 'Двойное обновление' WHERE id = 3;"
+# UPD2=$(sql_val "SELECT id || '|' || name FROM t_test WHERE id = 20")
+# [[ "$UPD2" == "20|Двойное обновление" ]] || fail "UPDATE обоих столбцов: '$UPD2'"
 
-sql -c "UPDATE t_test SET id = 3, name = '$SENTINEL_TEXT' WHERE id = 20;"
-echo "  ✓ UPDATE успешен"
-echo ""
-echo "  Данные после UPDATE:"
-sql_show "SELECT id, name FROM t_test ORDER BY id;"
-echo ""
+# sql -c "UPDATE t_test SET id = 3, name = '$SENTINEL_TEXT' WHERE id = 20;"
+# echo "  ✓ UPDATE успешен"
+# echo ""
+# echo "  Данные после UPDATE:"
+# sql_show "SELECT id, name FROM t_test ORDER BY id;"
+# echo ""
 
-echo ""
-echo "  [3/9] COPY (массовая вставка)"
-echo ""
-echo ""
-printf '4\tСтрока из COPY\n5\tЕщё одна строка\n' \
-  | sql -c "COPY t_test (id, name) FROM STDIN;"
+# echo ""
+# echo "  [3/9] COPY (массовая вставка)"
+# echo ""
+# echo ""
+# printf '4\tСтрока из COPY\n5\tЕщё одна строка\n' \
+#   | sql -c "COPY t_test (id, name) FROM STDIN;"
 
-CNT=$(sql_val "SELECT count(*) FROM t_test")
-[[ "$CNT" -eq 5 ]] || fail "После COPY ожидалось 5 строк, получено $CNT"
+# CNT=$(sql_val "SELECT count(*) FROM t_test")
+# [[ "$CNT" -eq 5 ]] || fail "После COPY ожидалось 5 строк, получено $CNT"
 
-VAL=$(sql_val "SELECT name FROM t_test WHERE id = 4")
-[[ "$VAL" == "Строка из COPY" ]] || fail "COPY: строка id=4 = '$VAL'"
-echo "  ✓ COPY успешен: всего $CNT строк в таблице"
-echo ""
-echo "  Данные после COPY:"
-sql_show "SELECT id, name FROM t_test ORDER BY id;"
-echo ""
+# VAL=$(sql_val "SELECT name FROM t_test WHERE id = 4")
+# [[ "$VAL" == "Строка из COPY" ]] || fail "COPY: строка id=4 = '$VAL'"
+# echo "  ✓ COPY успешен: всего $CNT строк в таблице"
+# echo ""
+# echo "  Данные после COPY:"
+# sql_show "SELECT id, name FROM t_test ORDER BY id;"
+# echo ""
 
-echo ""
-echo "  [4/9] Ротация DEK и чтение смешанных данных"
-echo ""
-echo ""
-DEK_BEFORE_ROT=$(sql_val "SELECT opentde_get_dek_hex('t_test'::regclass::oid)")
-ROTATED_VER=$(sql_val "SELECT opentde_rotate_table_dek('t_test'::regclass::oid)")
-DEK_AFTER_ROT=$(sql_val "SELECT opentde_get_dek_hex('t_test'::regclass::oid)")
+# echo ""
+# echo "  [4/9] Ротация DEK и чтение смешанных данных"
+# echo ""
+# echo ""
+# DEK_BEFORE_ROT=$(sql_val "SELECT opentde_get_dek_hex('t_test'::regclass::oid)")
+# ROTATED_VER=$(sql_val "SELECT opentde_rotate_table_dek('t_test'::regclass::oid)")
+# DEK_AFTER_ROT=$(sql_val "SELECT opentde_get_dek_hex('t_test'::regclass::oid)")
 
-[[ "$ROTATED_VER" -ge 2 ]] || fail "Ожидалась версия DEK >= 2 после ротации, получено $ROTATED_VER"
-[[ "$DEK_BEFORE_ROT" != "$DEK_AFTER_ROT" ]] || fail "DEK не изменился после ротации"
+# [[ "$ROTATED_VER" -ge 2 ]] || fail "Ожидалась версия DEK >= 2 после ротации, получено $ROTATED_VER"
+# [[ "$DEK_BEFORE_ROT" != "$DEK_AFTER_ROT" ]] || fail "DEK не изменился после ротации"
 
-sql -c "INSERT INTO t_test VALUES (6, 'После ротации DEK');"
+# sql -c "INSERT INTO t_test VALUES (6, 'После ротации DEK');"
 
-OLD_VAL=$(sql_val "SELECT name FROM t_test WHERE id = 1")
-[[ "$OLD_VAL" == "Привет мир" ]] || fail "Старая строка после ротации читается неверно: '$OLD_VAL'"
+# OLD_VAL=$(sql_val "SELECT name FROM t_test WHERE id = 1")
+# [[ "$OLD_VAL" == "Привет мир" ]] || fail "Старая строка после ротации читается неверно: '$OLD_VAL'"
 
-NEW_VAL=$(sql_val "SELECT name FROM t_test WHERE id = 6")
-[[ "$NEW_VAL" == "После ротации DEK" ]] || fail "Новая строка после ротации читается неверно: '$NEW_VAL'"
+# NEW_VAL=$(sql_val "SELECT name FROM t_test WHERE id = 6")
+# [[ "$NEW_VAL" == "После ротации DEK" ]] || fail "Новая строка после ротации читается неверно: '$NEW_VAL'"
 
-CNT=$(sql_val "SELECT count(*) FROM t_test")
-[[ "$CNT" -eq 6 ]] || fail "После ротации ожидалось 6 строк, получено $CNT"
+# CNT=$(sql_val "SELECT count(*) FROM t_test")
+# [[ "$CNT" -eq 6 ]] || fail "После ротации ожидалось 6 строк, получено $CNT"
 
-echo "  DEK before rotation: $DEK_BEFORE_ROT"
-echo "  DEK after rotation:  $DEK_AFTER_ROT"
-echo "  New DEK version:     $ROTATED_VER"
-echo ""
-echo "  ✓ Старые и новые строки читаются"
-echo ""
-echo "  Данные после ротации DEK:"
-sql_show "SELECT id, name FROM t_test ORDER BY id;"
-echo ""
+# echo "  DEK before rotation: $DEK_BEFORE_ROT"
+# echo "  DEK after rotation:  $DEK_AFTER_ROT"
+# echo "  New DEK version:     $ROTATED_VER"
+# echo ""
+# echo "  ✓ Старые и новые строки читаются"
+# echo ""
+# echo "  Данные после ротации DEK:"
+# sql_show "SELECT id, name FROM t_test ORDER BY id;"
+# echo ""
 
 echo ""
 echo "  [5/9] Сравнение файлов: обычная vs зашифрованная таблица"

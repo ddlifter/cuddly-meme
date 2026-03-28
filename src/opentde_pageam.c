@@ -1,4 +1,3 @@
-
 #include "postgres.h"
 #include "fmgr.h"
 #include "opentde_pagestore.c" // for opentde_pagestore_header, helpers, magic/version
@@ -17,7 +16,7 @@ typedef struct opentde_tableam_scan {
     bool pagestore_opened;
 } opentde_tableam_scan;
 static const TupleTableSlotOps *opentde_slot_callbacks(Relation rel) {
-    return &TTSOpsVirtual;
+    return &TTSOpsHeapTuple;
 }
 
 static TableScanDesc opentde_scan_begin(Relation rel, Snapshot snapshot, int nkeys, ScanKey key, ParallelTableScanDesc pscan, uint32 flags) {
@@ -43,9 +42,17 @@ static bool opentde_scan_getnextslot(TableScanDesc scan, ScanDirection direction
         return false;
     if (!opentde_pagestore_scan_next(&s->pagestore_scan, &tuple))
         return false;
+    elog(LOG, "OpenTDE: TableAM scan_getnextslot returning tuple with t_len=%d", (int)tuple->t_len);
+    ExecClearTuple(slot);
+    slot->tts_tupleDescriptor = s->rel->rd_att;
     ExecStoreHeapTuple(tuple, slot, false);
     return true;
 }
+
+static void opentde_scan_rescan(TableScanDesc scan, ScanKey key, bool set_params, bool allow_strat, bool allow_sync, bool allow_pagemode) {
+    elog(ERROR, "OpenTDE: scan_rescan not implemented");
+}
+
 static void opentde_scan_set_tidrange(TableScanDesc scan, ItemPointer mintid, ItemPointer maxtid) { elog(ERROR, "OpenTDE: scan_set_tidrange not implemented"); }
 static bool opentde_scan_getnextslot_tidrange(TableScanDesc scan, ScanDirection direction, TupleTableSlot *slot) { elog(ERROR, "OpenTDE: scan_getnextslot_tidrange not implemented"); return false; }
 static Size opentde_parallelscan_estimate(Relation rel) { elog(ERROR, "OpenTDE: parallelscan_estimate not implemented"); return 0; }
@@ -55,7 +62,26 @@ static struct IndexFetchTableData *opentde_index_fetch_begin(Relation rel) { elo
 static void opentde_index_fetch_reset(struct IndexFetchTableData *data) { elog(ERROR, "OpenTDE: index_fetch_reset not implemented"); }
 static void opentde_index_fetch_end(struct IndexFetchTableData *data) { elog(ERROR, "OpenTDE: index_fetch_end not implemented"); }
 static bool opentde_index_fetch_tuple(struct IndexFetchTableData *scan, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot, bool *call_again, bool *all_dead) { elog(ERROR, "OpenTDE: index_fetch_tuple not implemented"); return false; }
-static bool opentde_tuple_fetch_row_version(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot) { elog(ERROR, "OpenTDE: tuple_fetch_row_version not implemented"); return false; }
+static bool opentde_tuple_fetch_row_version(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot) {
+    /* Minimal implementation: scan all tuples, compare t_self with tid, store in slot if found */
+    opentde_pagestore_scan scan;
+    HeapTuple tuple = NULL;
+    bool found = false;
+    if (!opentde_pagestore_scan_open(RelationGetRelid(rel), &scan))
+        return false;
+    while (opentde_pagestore_scan_next(&scan, &tuple)) {
+        if (ItemPointerEquals(&tuple->t_self, tid)) {
+            ExecClearTuple(slot);
+            slot->tts_tupleDescriptor = rel->rd_att;
+            ExecStoreHeapTuple(tuple, slot, false);
+            found = true;
+            break;
+        }
+        heap_freetuple(tuple);
+    }
+    opentde_pagestore_scan_close(&scan);
+    return found;
+}
 static bool opentde_tuple_tid_valid(TableScanDesc scan, ItemPointer tid) { elog(ERROR, "OpenTDE: tuple_tid_valid not implemented"); return false; }
 static void opentde_tuple_get_latest_tid(TableScanDesc scan, ItemPointer tid) { elog(ERROR, "OpenTDE: tuple_get_latest_tid not implemented"); }
 static bool opentde_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot, Snapshot snapshot) { elog(ERROR, "OpenTDE: tuple_satisfies_snapshot not implemented"); return false; }
@@ -168,5 +194,6 @@ static const TableAmRoutine opentde_minimal_tableam = {
 Datum
 opentde_pageam_handler(PG_FUNCTION_ARGS)
 {
+    elog(LOG, "OpenTDE: opentde_pageam_handler called");
     PG_RETURN_POINTER(&opentde_minimal_tableam);
 }
