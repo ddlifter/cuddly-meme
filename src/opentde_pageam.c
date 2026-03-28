@@ -1,9 +1,11 @@
 #include "postgres.h"
 #include "fmgr.h"
-#include "opentde_pagestore.c" // for opentde_pagestore_header, helpers, magic/version
+#include "opentde_pagestore.h" // for opentde_pagestore_header, helpers, magic/version
 #include "executor/tuptable.h" // for TTSOpsVirtual
 #include "access/transam.h"    // for InvalidTransactionId
 #include "access/multixact.h"  // for InvalidMultiXactId
+
+#include "access/tableam.h"  // for Relation, TableScanDesc, TableAmRoutine, etc.
 
 PG_FUNCTION_INFO_V1(opentde_pageam_handler);
 
@@ -42,7 +44,7 @@ static bool opentde_scan_getnextslot(TableScanDesc scan, ScanDirection direction
         return false;
     if (!opentde_pagestore_scan_next(&s->pagestore_scan, &tuple))
         return false;
-    elog(LOG, "OpenTDE: TableAM scan_getnextslot returning tuple with t_len=%d", (int)tuple->t_len);
+    /* elog(LOG, "OpenTDE: TableAM scan_getnextslot returning tuple with t_len=%d", (int)tuple->t_len); */
     ExecClearTuple(slot);
     slot->tts_tupleDescriptor = s->rel->rd_att;
     ExecStoreHeapTuple(tuple, slot, false);
@@ -197,6 +199,6 @@ static const TableAmRoutine opentde_minimal_tableam = {
 Datum
 opentde_pageam_handler(PG_FUNCTION_ARGS)
 {
-    elog(LOG, "OpenTDE: opentde_pageam_handler called");
+    /* elog(LOG, "OpenTDE: opentde_pageam_handler called"); */
     PG_RETURN_POINTER(&opentde_minimal_tableam);
 }
