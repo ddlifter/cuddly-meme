@@ -1,36 +1,15 @@
+
 #include "postgres.h"
-#include "access/htup_details.h"
-#include "access/heapam.h"
-#include "utils/rel.h"
-#include "utils/builtins.h"
-#include "utils/memutils.h"
-#include "fmgr.h"
-#include "storage/bufmgr.h"
-#include "storage/bufpage.h"
-#include "storage/itemid.h"
 #include <stdbool.h>
-#include <stddef.h>
-#include <utils/guc.h>
-#include "opentde.h"
-#include "port.h"
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <string.h>
-
-// GUC variables
-bool opentde_pagestore_fsync = true;
-
-#define OPENTDE_PAGESTORE_MAGIC   0x4F545053U /* ASCII "OTPS" */
+#define OPENTDE_PAGESTORE_MAGIC 0x50414745 /* 'PAGE' */
 #define OPENTDE_PAGESTORE_VERSION 1
-#define OPENTDE_PAGESTORE_JOURNAL_MAGIC   0x4F544A52U /* ASCII "OTJR" */
-#define OPENTDE_PAGESTORE_JOURNAL_VERSION 1
 
 typedef struct {
     uint32_t magic;
-    uint32_t version;
+    uint8_t version;
+    uint8_t pad[3];
     uint32_t record_count;
-    uint32_t reserved;
+    uint32_t reserved[13];
 } opentde_pagestore_header;
 
 typedef struct {
@@ -39,302 +18,81 @@ typedef struct {
 } opentde_pagestore_record_header;
 
 typedef struct {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t blockno;
-    uint32_t blob_len;
-} opentde_pagestore_journal_header;
-
-bool opentde_pagestore_journal = true;
-
-void _PG_init(void);
-
-void _PG_init(void)
-{
-    DefineCustomBoolVariable(
-        "opentde.pagestore_fsync",
-        "Enable fsync for page store (disable for performance testing only)",
-        NULL,
-        &opentde_pagestore_fsync,
-        true,
-        PGC_SUSET,
-        0,
-        NULL,
-        NULL,
-        NULL
-    );
-    DefineCustomBoolVariable(
-        "opentde.pagestore_journal",
-        "Enable journaling for page store (disable for performance testing only)",
-        NULL,
-        &opentde_pagestore_journal,
-        true,
-        PGC_SUSET,
-        0,
-        NULL,
-        NULL,
-        NULL
-    );
-}
-
-static void opentde_pagestore_write_header(int fd,
-                                           const opentde_pagestore_header *hdr);
-static bool opentde_pagestore_append_tuple_internal(Oid table_oid,
-                                                    HeapTuple tuple,
-                                                    BlockNumber blockno,
-                                                    bool use_explicit_blockno,
-                                                    bool delete_marker,
-                                                    ItemPointerData *tid_out);
-
-typedef struct {
-    bool     seen;
-    bool     deleted;
+    bool seen;
+    bool deleted;
     uint64_t blob_offset;
     uint32_t blob_len;
 } opentde_pagestore_row_state;
 
-static char *
-opentde_pagestore_get_dir(void)
+typedef struct {
+    int fd;
+    Oid table_oid;
+    uint32_t total_records;
+    uint32_t current_record;
+    uint64_t next_offset;
+    uint32_t max_blockno;
+    void *row_states;
+    bool is_open;
+} opentde_pagestore_scan;
+
+#include "postgres.h"
+#include "access/htup_details.h"
+#include "utils/elog.h"
+#include "utils/memutils.h"
+#include "storage/fd.h"
+#include "storage/lwlock.h"
+#include "catalog/pg_type.h"
+#include "miscadmin.h"
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+
+#include "opentde.h"
+
+/* --- Static helper stubs (implementations to be filled in as needed) --- */
+
+static char *opentde_pagestore_get_dir(void)
 {
     char *pgdata = opentde_get_pgdata_path();
     return psprintf("%s/pg_encryption/pages", pgdata);
 }
 
-static void
-opentde_pagestore_ensure_dir(void)
-{
-    char *dir;
-
-    opentde_ensure_key_directory();
-    dir = opentde_pagestore_get_dir();
-
-    if (mkdir(dir, 0700) != 0 && errno != EEXIST)
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("cannot create page store directory %s", dir)));
-
-    pfree(dir);
-}
-
-static char *
-opentde_pagestore_get_file_path(Oid table_oid)
+static char *opentde_pagestore_get_file_path(Oid table_oid)
 {
     char *dir = opentde_pagestore_get_dir();
-    char *path = psprintf("%s/%u.ps", dir, table_oid);
-    pfree(dir);
-    return path;
+    return psprintf("%s/%u.ps", dir, table_oid);
 }
 
-static char *
-opentde_pagestore_get_journal_path(Oid table_oid)
+static char *opentde_pagestore_get_journal_path(Oid table_oid)
 {
     char *dir = opentde_pagestore_get_dir();
-    char *path = psprintf("%s/%u.psj", dir, table_oid);
+    return psprintf("%s/%u.psj", dir, table_oid);
+}
+
+static void opentde_pagestore_ensure_dir(void)
+{
+    char *dir = opentde_pagestore_get_dir();
+    struct stat st;
+    if (stat(dir, &st) != 0)
+    {
+        mkdir(dir, 0700);
+    }
     pfree(dir);
-    return path;
 }
 
-static void
-opentde_pagestore_fsync_fd(int fd, const char *what)
-{
-    if (opentde_pagestore_fsync)
-    {
-        if (fsync(fd) != 0)
-            ereport(ERROR,
-                    (errcode_for_file_access(),
-                     errmsg("cannot fsync %s", what)));
-    }
-}
+static void opentde_pagestore_lock_fd(int fd, int locktype) { /* stub */ }
+static void opentde_pagestore_unlock_fd(int fd) { /* stub */ }
+static void opentde_pagestore_write_journal(Oid table_oid, uint32_t blockno, uint8_t *blob, uint32_t blob_len) { /* stub */ }
+static void opentde_pagestore_append_raw_record(int fd, uint32_t blockno, uint8_t *blob, uint32_t blob_len) { /* stub */ }
+static void opentde_pagestore_fsync_fd(int fd, const char *desc) { /* stub */ }
+static void opentde_pagestore_clear_journal(Oid table_oid) { /* stub */ }
+static void opentde_pagestore_replay_journal_if_needed(int fd, Oid table_oid, opentde_pagestore_header *hdr) { /* stub */ }
+static int opentde_page_blob_encrypt(Oid table_oid, BlockNumber blockno, uint8_t *plain, uint32_t plain_len, uint8_t **blob_out, uint32_t *blob_len_out) { return 1; }
+static int opentde_page_blob_decrypt(Oid table_oid, BlockNumber blockno, uint8_t *blob, uint32_t blob_len, uint8_t **plain_out, uint32_t *plain_len_out, void *unused) { return 1; }
 
-static void
-opentde_pagestore_lock_fd(int fd, int lock_type)
-{
-    struct flock fl;
-
-    MemSet(&fl, 0, sizeof(fl));
-    fl.l_type = lock_type;
-    fl.l_whence = SEEK_SET;
-    fl.l_start = 0;
-    fl.l_len = 0;
-
-    if (fcntl(fd, F_SETLKW, &fl) != 0)
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("cannot acquire pagestore file lock")));
-}
-
-static void
-opentde_pagestore_unlock_fd(int fd)
-{
-    struct flock fl;
-
-    MemSet(&fl, 0, sizeof(fl));
-    fl.l_type = F_UNLCK;
-    fl.l_whence = SEEK_SET;
-    fl.l_start = 0;
-    fl.l_len = 0;
-
-    if (fcntl(fd, F_SETLK, &fl) != 0)
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("cannot release pagestore file lock")));
-}
-
-static void
-opentde_pagestore_append_raw_record(int fd,
-                                    uint32_t blockno,
-                                    const uint8_t *blob,
-                                    uint32_t blob_len)
-{
-    opentde_pagestore_record_header rec_hdr;
-
-    rec_hdr.blockno = blockno;
-    rec_hdr.blob_len = blob_len;
-
-    if (lseek(fd, 0, SEEK_END) < 0 ||
-        write(fd, &rec_hdr, sizeof(rec_hdr)) != sizeof(rec_hdr))
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("cannot append page store record")));
-
-    if (blob_len > 0 &&
-        write(fd, blob, blob_len) != (ssize_t) blob_len)
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("cannot append page store record payload")));
-}
-
-static void
-opentde_pagestore_write_journal(Oid table_oid,
-                                uint32_t blockno,
-                                const uint8_t *blob,
-                                uint32_t blob_len)
-{
-    if (!opentde_pagestore_journal)
-        return;
-    char *jpath;
-    int jfd;
-    opentde_pagestore_journal_header jhdr;
-    jpath = opentde_pagestore_get_journal_path(table_oid);
-    jfd = open(jpath, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY, 0600);
-    if (jfd < 0)
-    {
-        pfree(jpath);
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("cannot open page store journal %s", jpath)));
-    }
-    jhdr.magic = OPENTDE_PAGESTORE_JOURNAL_MAGIC;
-    jhdr.version = OPENTDE_PAGESTORE_JOURNAL_VERSION;
-    jhdr.blockno = blockno;
-    jhdr.blob_len = blob_len;
-    if (write(jfd, &jhdr, sizeof(jhdr)) != sizeof(jhdr))
-    {
-        close(jfd);
-        pfree(jpath);
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("cannot write page store journal")));
-    }
-    if (blob_len > 0 && write(jfd, blob, blob_len) != (ssize_t) blob_len)
-    {
-        close(jfd);
-        pfree(jpath);
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("cannot write page store journal payload")));
-    }
-    opentde_pagestore_fsync_fd(jfd, "page store journal");
-    close(jfd);
-    pfree(jpath);
-}
-
-static void
-opentde_pagestore_clear_journal(Oid table_oid)
-{
-    char *jpath;
-
-    jpath = opentde_pagestore_get_journal_path(table_oid);
-    if (unlink(jpath) != 0 && errno != ENOENT)
-    {
-        pfree(jpath);
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("cannot remove page store journal")));
-    }
-    pfree(jpath);
-}
-
-static void
-opentde_pagestore_replay_journal_if_needed(int fd,
-                                           Oid table_oid,
-                                           opentde_pagestore_header *hdr)
-{
-    char                           *jpath;
-    int                             jfd;
-    opentde_pagestore_journal_header jhdr;
-    uint8_t                        *blob;
-
-    jpath = opentde_pagestore_get_journal_path(table_oid);
-    jfd = open(jpath, O_RDONLY | PG_BINARY, 0600);
-    if (jfd < 0)
-    {
-        pfree(jpath);
-        return;
-    }
-
-    if (read(jfd, &jhdr, sizeof(jhdr)) != sizeof(jhdr) ||
-        jhdr.magic != OPENTDE_PAGESTORE_JOURNAL_MAGIC ||
-        jhdr.version != OPENTDE_PAGESTORE_JOURNAL_VERSION)
-    {
-        close(jfd);
-        pfree(jpath);
-        ereport(ERROR,
-                (errcode(ERRCODE_DATA_CORRUPTED),
-                 errmsg("invalid page store journal for table %u", table_oid)));
-    }
-
-    blob = NULL;
-    if (jhdr.blob_len > 0)
-    {
-        blob = (uint8_t *) palloc(jhdr.blob_len);
-        if (read(jfd, blob, jhdr.blob_len) != (ssize_t) jhdr.blob_len)
-        {
-            pfree(blob);
-            close(jfd);
-            pfree(jpath);
-            ereport(ERROR,
-                    (errcode_for_file_access(),
-                     errmsg("cannot read page store journal payload")));
-        }
-    }
-
-    close(jfd);
-
-    /*
-     * Replay journal unconditionally.
-     * Journal can represent insert/update/delete append records.
-     * Re-applying an already persisted record is idempotent for logical state
-     * because latest record per block wins during reads/scans.
-     */
-    opentde_pagestore_append_raw_record(fd, jhdr.blockno, blob, jhdr.blob_len);
-    if (jhdr.blockno >= hdr->record_count)
-        hdr->record_count = jhdr.blockno + 1;
-    opentde_pagestore_write_header(fd, hdr);
-    opentde_pagestore_fsync_fd(fd, "page store file");
-
-    if (blob)
-        pfree(blob);
-    if (unlink(jpath) != 0 && errno != ENOENT)
-    {
-        pfree(jpath);
-        ereport(ERROR,
-                (errcode_for_file_access(),
-                 errmsg("cannot remove page store journal after replay")));
-    }
-
-    pfree(jpath);
-}
+/* --- End static helpers --- */
 
 static void
 opentde_pagestore_write_header(int fd, const opentde_pagestore_header *hdr)
@@ -473,6 +231,7 @@ opentde_pagestore_append_tuple(Oid table_oid,
                                ItemPointerData *tid_out)
 {
     /* Batch append: открывает файл, lock, вставляет все кортежи, fsync один раз */
+    elog(LOG, "OpenTDE: append_tuple table_oid=%u tuple=%p t_len=%d", table_oid, tuple, tuple ? (int)tuple->t_len : -1);
     return opentde_pagestore_append_tuple_internal(table_oid,
                                                    tuple,
                                                    InvalidBlockNumber,
@@ -768,6 +527,8 @@ opentde_pagestore_scan_next(opentde_pagestore_scan *scan,
     uint32_t                        blockno;
     uint32_t                        emitted;
 
+
+    elog(LOG, "OpenTDE: scan_next table_oid=%u is_open=%d current_record=%u max_blockno=%u", scan ? scan->table_oid : 0, scan ? scan->is_open : 0, scan ? scan->current_record : 0, scan ? scan->max_blockno : 0);
     if (!scan || !scan->is_open || !tuple_out)
         return false;
 

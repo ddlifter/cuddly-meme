@@ -1,4 +1,32 @@
 #include "opentde.h"
+#include <stddef.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include "postgres.h"
+#include "utils/guc.h"
+
+/*
+ * Гарантирует, что мастер-ключ и DEK загружены в память процесса.
+ * Если ключи не загружены — пытается загрузить их с диска/Vault.
+ */
+void opentde_ensure_keys_loaded(void)
+{
+    if (!master_key_set) {
+        elog(WARNING, "[OpenTDE] ensure_keys_loaded: master_key_set is false, trying to load from Vault");
+        if (opentde_load_master_key_from_file()) {
+            master_key_set = true;
+            elog(WARNING, "[OpenTDE] ensure_keys_loaded: master_key_set is now true");
+            if (!global_key_mgr)
+                opentde_init_key_manager();
+            opentde_load_key_file();
+            opentde_load_iv_file();
+        } else {
+            elog(WARNING, "[OpenTDE] ensure_keys_loaded: failed to load master key from Vault");
+        }
+    } else {
+        elog(WARNING, "[OpenTDE] ensure_keys_loaded: master_key_set is already true");
+    }
+}
 #include "port.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
@@ -995,30 +1023,29 @@ opentde_load_iv_file(void)
 void
 opentde_save_iv_file(void)
 {
-    char            *iv_path;
-    int              fd;
-    iv_file_header   header;
-    int              i;
+    char *iv_path;
+    int fd;
+    iv_file_header header;
+    uint32_t i;
 
     if (!global_key_mgr)
-        return;
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("key manager is not initialized")));
 
     iv_path = get_iv_file_path();
-    opentde_ensure_key_directory();
-
-    fd = open(iv_path, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY, 0600);
+    fd = open(iv_path, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY, 0600);
     if (fd < 0)
     {
         pfree(iv_path);
         ereport(ERROR,
                 (errcode_for_file_access(),
-                 errmsg("cannot open iv file %s", iv_path)));
+                 errmsg("cannot open IV file for writing: %s", iv_path)));
     }
 
-    memset(&header, 0, sizeof(header));
-    header.magic    = IV_FILE_MAGIC;
-    header.version  = IV_VERSION;
-    header.iv_count = (uint32_t) global_key_mgr->iv_count;
+    header.magic = IV_FILE_MAGIC;
+    header.version = IV_VERSION;
+    header.iv_count = global_key_mgr->iv_count;
 
     if (write(fd, &header, sizeof(iv_file_header)) != sizeof(iv_file_header))
     {
@@ -1026,19 +1053,16 @@ opentde_save_iv_file(void)
         pfree(iv_path);
         ereport(ERROR,
                 (errcode_for_file_access(),
-                 errmsg("cannot write iv file header")));
+                 errmsg("cannot write IV file header")));
     }
 
     for (i = 0; i < global_key_mgr->iv_count; i++)
     {
         iv_file_entry entry;
-
-        memset(&entry, 0, sizeof(entry));
-        entry.table_oid  = global_key_mgr->ivs[i].table_oid;
-        entry.block      = global_key_mgr->ivs[i].block;
-        entry.offset     = global_key_mgr->ivs[i].offset;
+        entry.table_oid = global_key_mgr->ivs[i].table_oid;
+        entry.block = global_key_mgr->ivs[i].block;
+        entry.offset = global_key_mgr->ivs[i].offset;
         entry.key_version = global_key_mgr->ivs[i].key_version;
-        entry.created_at = (uint64_t) time(NULL);
         memcpy(entry.iv, global_key_mgr->ivs[i].iv, DATA_IV_SIZE);
 
         if (write(fd, &entry, sizeof(iv_file_entry)) != sizeof(iv_file_entry))
@@ -1056,6 +1080,7 @@ opentde_save_iv_file(void)
     opentde_pending_iv_flush = 0;
     opentde_iv_file_entry_count = (uint32) global_key_mgr->iv_count;
 }
+
 
 /*
  * Регистрация IV для кортежа.
@@ -1313,6 +1338,7 @@ opentde_save_master_key_to_file(void)
 
     if (response)
         free(response);
+
 
     elog(DEBUG1, "[OpenTDE] Master key saved to Vault path %s", vault_path);
 }

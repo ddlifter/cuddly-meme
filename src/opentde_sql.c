@@ -1,4 +1,17 @@
+#include "postgres.h"
+#include "fmgr.h"
+
+PG_FUNCTION_INFO_V1(opentde_page_crypto_selftest);
+
+Datum
+opentde_page_crypto_selftest(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_VOID();
+}
 #include "opentde.h"
+#include "postgres.h"
+#include <stdbool.h>
+#include <stdio.h>
 #include "catalog/pg_type_d.h"
 #include "utils/array.h"
 #include <openssl/hmac.h>

@@ -1,0 +1,6 @@
+Удалить следующие файлы и их упоминания из Makefile и других частей проекта:
+- opentde_pageam.c
+- opentde_pagestore.c
+- opentde_pagecrypto.c
+
+Вся page-level логика теперь реализуется только через кастомный SMGR (encrypted_smgr/pg_encrypted_smgr).

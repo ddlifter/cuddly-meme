@@ -1,5 +1,4 @@
-# opentde extension
-comment = 'Open Transparent Data Encryption for PostgreSQL'
-default_version = '1.0'
+# opentde page-level TDE
+comment = 'Open Transparent Data Encryption for PostgreSQL (page-level, extension)'
 module_pathname = '$libdir/opentde'
-relocatable = true
+default_version = '1.0'

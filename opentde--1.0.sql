@@ -1,6 +1,5 @@
 /* opentde--1.0.sql */
 
-\echo Use "CREATE EXTENSION opentde" to load this file. \quit
 
 CREATE FUNCTION opentde_set_master_key(bytea)
 RETURNS void
@@ -17,23 +16,14 @@ RETURNS int4
 AS 'MODULE_PATHNAME', 'opentde_rotate_table_dek_sql'
 LANGUAGE C STRICT;
 
+
 CREATE FUNCTION opentde_pageam_handler(internal)
 RETURNS table_am_handler
 AS 'MODULE_PATHNAME', 'opentde_pageam_handler'
 LANGUAGE C STRICT;
 
-CREATE FUNCTION opentde_debug_keys()
-RETURNS text
-AS 'MODULE_PATHNAME', 'opentde_debug_keys'
-LANGUAGE C STRICT;
-
-CREATE FUNCTION opentde_get_dek_hex(oid)
-RETURNS text
-AS 'MODULE_PATHNAME', 'opentde_get_dek_hex'
-LANGUAGE C STRICT;
-
 CREATE FUNCTION opentde_page_crypto_selftest(oid, int4, bytea)
-RETURNS boolean
+RETURNS void
 AS 'MODULE_PATHNAME', 'opentde_page_crypto_selftest'
 LANGUAGE C STRICT;
 
@@ -49,17 +39,6 @@ CREATE FUNCTION opentde_blind_index(text)
 RETURNS bytea
 AS 'MODULE_PATHNAME', 'opentde_blind_index'
 LANGUAGE C IMMUTABLE STRICT;
-
--- Bucket blind index для диапазонов bigint.
--- В индекс попадает токен бакета, а точность добирается post-filter'ом.
--- Использование:
---   CREATE INDEX idx_amount_bucket
---     ON t ((opentde_blind_bucket_int8(amount, 100)));
---
---   SELECT *
---   FROM t
---   WHERE opentde_blind_bucket_int8(amount, 100)
---         = ANY (opentde_blind_bucket_tokens_int8(1050, 1890, 100))
 --     AND amount BETWEEN 1050 AND 1890;
 CREATE FUNCTION opentde_blind_bucket_int8(bigint, bigint)
 RETURNS bytea

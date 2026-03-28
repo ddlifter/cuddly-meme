@@ -81,6 +81,7 @@ opentde_find_table_key_index(Oid table_oid, uint32_t key_version)
 }
 
 /* Возвращает прямой указатель на DEK указанной версии без лишних аллокаций. */
+
 static const uint8_t *
 opentde_get_table_dek_ptr_by_version(Oid table_oid, uint32_t key_version)
 {
@@ -90,6 +91,7 @@ opentde_get_table_dek_ptr_by_version(Oid table_oid, uint32_t key_version)
     static int      cached_key_count = -1;
     int idx;
 
+    opentde_ensure_keys_loaded();
     if (!master_key_set || !global_key_mgr)
     {
         ereport(ERROR,
@@ -231,6 +233,7 @@ opentde_get_active_table_key_version(Oid table_oid)
 {
     int idx;
 
+    opentde_ensure_keys_loaded();
     if (!master_key_set || !global_key_mgr)
     {
         ereport(ERROR,
@@ -255,6 +258,7 @@ opentde_get_table_dek_by_version(Oid table_oid, uint32_t key_version)
     uint8_t *result_dek;
     int      idx;
 
+    opentde_ensure_keys_loaded();
     if (!master_key_set || !global_key_mgr)
     {
         ereport(ERROR,
@@ -303,6 +307,8 @@ opentde_rotate_table_dek(Oid table_oid)
     int      i;
     int      idx;
 
+
+    opentde_ensure_keys_loaded();
     if (!master_key_set || !global_key_mgr)
     {
         ereport(ERROR,
