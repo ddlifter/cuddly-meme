@@ -1,3 +1,4 @@
+
 /* opentde--1.0.sql */
 
 
@@ -28,7 +29,7 @@ AS 'MODULE_PATHNAME', 'opentde_page_crypto_selftest'
 LANGUAGE C STRICT;
 
 
-CREATE ACCESS METHOD opentde_page TYPE TABLE HANDLER opentde_pageam_handler;
+CREATE ACCESS METHOD tde TYPE TABLE HANDLER opentde_pageam_handler;
 
 -- Blind index: HMAC-SHA256(master_key, value).
 -- Файл индекса хранит только HMAC-дайджесты, а не открытые значения.

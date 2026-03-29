@@ -11,7 +11,6 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "postgres.h"
-#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "executor/executor.h"
@@ -28,7 +27,6 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "postgres.h"
-#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "executor/executor.h"

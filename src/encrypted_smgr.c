@@ -4,22 +4,8 @@
 
 PG_MODULE_MAGIC;
 
-// Минимальная реализация: просто проксирует md.c
-static void encrypted_smgr_init(void) {}
-static void encrypted_smgr_open(SMgrRelation reln, SmgrChainIndex chain_index) {}
-static void encrypted_smgr_close(SMgrRelation reln, ForkNumber forknum, SmgrChainIndex chain_index) {}
-static void encrypted_smgr_create(SMgrRelation reln, ForkNumber forknum, bool isRedo, SmgrChainIndex chain_index) {}
-static bool encrypted_smgr_exists(SMgrRelation reln, ForkNumber forknum, SmgrChainIndex chain_index) { return false; }
-static void encrypted_smgr_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo, SmgrChainIndex chain_index) {}
-static void encrypted_smgr_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, const void *buffer, bool skipFsync, SmgrChainIndex chain_index) {}
-static void encrypted_smgr_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, int nblocks, bool skipFsync, SmgrChainIndex chain_index) {}
-static bool encrypted_smgr_prefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, int nblocks, SmgrChainIndex chain_index) { return false; }
-static void encrypted_smgr_readv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, void **buffers, BlockNumber nblocks, SmgrChainIndex chain_index) {}
-static void encrypted_smgr_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, const void **buffers, BlockNumber nblocks, bool skipFsync, SmgrChainIndex chain_index) {}
-static void encrypted_smgr_writeback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, BlockNumber nblocks, SmgrChainIndex chain_index) {}
-static BlockNumber encrypted_smgr_nblocks(SMgrRelation reln, ForkNumber forknum, SmgrChainIndex chain_index) { return 0; }
-static void encrypted_smgr_truncate(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks, SmgrChainIndex chain_index) {}
-static void encrypted_smgr_immedsync(SMgrRelation reln, ForkNumber forknum, SmgrChainIndex chain_index) {}
+
+#include "pg_encrypted_smgr.c"
 
 static const f_smgr encrypted_smgr = {
     .name = "encrypted",

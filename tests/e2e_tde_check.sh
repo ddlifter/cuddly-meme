@@ -10,6 +10,15 @@ MASTER_HEX="00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 PGBIN="${PGBIN:-$HOME/diploma/pg_build/bin}"
 SENTINEL_TEXT="SENTINEL_OPENTDE_12345"
 
+# --- Vault environment variables (edit as needed) ---
+export VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
+export VAULT_PATH="${VAULT_PATH:-secret/pg_tde}"
+export VAULT_FIELD="${VAULT_FIELD:-master_key}"
+export VAULT_TOKEN="${VAULT_TOKEN:-}"
+if [[ -z "$VAULT_TOKEN" ]]; then
+  echo "[WARN] VAULT_TOKEN is not set. Master key loading from Vault will fail!"
+fi
+
 PSQL="$PGBIN/psql"
 PG_CTL="$PGBIN/pg_ctl"
 
@@ -59,10 +68,11 @@ DROP FUNCTION IF EXISTS opentde_page_crypto_selftest(oid, int4, bytea);
 CREATE EXTENSION opentde;
 SELECT opentde_set_master_key(decode('$MASTER_HEX', 'hex'));
 
+
 CREATE TABLE t_test (
   id   int,
   name text
-) USING opentde_page;
+);
 
 CREATE TABLE t_plain (
   id   int,

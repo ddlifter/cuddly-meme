@@ -7,9 +7,10 @@ DROP EXTENSION IF EXISTS opentde CASCADE;
 CREATE EXTENSION opentde;
 SELECT opentde_set_master_key(decode('00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff', 'hex'));
 
+
 CREATE TABLE t_simple_encrypted (
   id int
-) USING opentde_page;
+) USING tde;
 
 CREATE TABLE t_simple_plain (
   id int

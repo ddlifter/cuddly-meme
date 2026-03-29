@@ -11,13 +11,14 @@ CREATE EXTENSION opentde;
 SELECT opentde_set_master_key(decode('00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff', 'hex'));
 
 -- Таблица с шифрованием (OpenTDE)
+
 CREATE TABLE t_encrypted (
   id   bigint PRIMARY KEY,
   name text,
   balance integer,
   email text,
   data text
-) USING opentde_page;
+) USING tde;
 
 -- Обычная таблица (Heap)
 CREATE TABLE t_plain (
