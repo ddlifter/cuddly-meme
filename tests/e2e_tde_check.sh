@@ -100,6 +100,9 @@ CREATE TABLE t_plain (
   name text
 );
 
+CREATE INDEX t_test_name_idx ON t_test(name);
+CREATE INDEX t_plain_name_idx ON t_plain(name);
+
 INSERT INTO t_test VALUES (1, 'Привет мир');
 INSERT INTO t_test VALUES (2, 'Тестовая строка');
 INSERT INTO t_test VALUES (3, '$SENTINEL_TEXT');
@@ -202,11 +205,17 @@ echo ""
 sql -c "CHECKPOINT;"
 ENC_RELPATH=$(sql_val "SELECT pg_relation_filepath('t_test'::regclass)")
 PLAIN_RELPATH=$(sql_val "SELECT pg_relation_filepath('t_plain'::regclass)")
+ENC_IDX_RELPATH=$(sql_val "SELECT pg_relation_filepath('t_test_name_idx'::regclass)")
+PLAIN_IDX_RELPATH=$(sql_val "SELECT pg_relation_filepath('t_plain_name_idx'::regclass)")
 ENC_FILE="$PGDATA/$ENC_RELPATH"
 PLAIN_FILE="$PGDATA/$PLAIN_RELPATH"
+ENC_IDX_FILE="$PGDATA/$ENC_IDX_RELPATH"
+PLAIN_IDX_FILE="$PGDATA/$PLAIN_IDX_RELPATH"
 
 [[ -f "$PLAIN_FILE" ]] || fail "Файл обычной таблицы не найден: $PLAIN_FILE"
 [[ -f "$ENC_FILE" ]] || fail "Файл зашифрованной таблицы не найден: $ENC_FILE"
+[[ -f "$PLAIN_IDX_FILE" ]] || fail "Файл обычного индекса не найден: $PLAIN_IDX_FILE"
+[[ -f "$ENC_IDX_FILE" ]] || fail "Файл зашифрованного индекса не найден: $ENC_IDX_FILE"
 
 SENTINEL_HEX=$(to_hex "$SENTINEL_TEXT")
 echo "  Sentinel String:  $SENTINEL_TEXT"
@@ -215,8 +224,11 @@ echo ""
 echo "  Файлы таблиц:"
 echo "    Plain:     $PLAIN_FILE"
 echo "    Encrypted: $ENC_FILE"
+echo "  Файлы индексов:"
+echo "    Plain idx:     $PLAIN_IDX_FILE"
+echo "    Encrypted idx: $ENC_IDX_FILE"
 echo ""
-ls -lh "$PLAIN_FILE" "$ENC_FILE" | sed 's/^/    /'
+ls -lh "$PLAIN_FILE" "$ENC_FILE" "$PLAIN_IDX_FILE" "$ENC_IDX_FILE" | sed 's/^/    /'
 echo ""
 echo "  Содержимое файла PLAIN (hexdump):"
 echo "  ----"
@@ -237,6 +249,15 @@ if hexdump -v -e '/1 "%02x"' "$ENC_FILE" | grep -q -i "$SENTINEL_HEX"; then
   fail "hex-паттерн найден в зашифрованной таблице $ENC_RELPATH"
 fi
 echo "  ✓ ENCRYPTED: hex-паттерн отсутствует"
+
+PLAIN_IDX_NIBBLE_OFFSET=$(hexdump -v -e '/1 "%02x"' "$PLAIN_IDX_FILE" | grep -bo -m1 "$SENTINEL_HEX" | cut -d: -f1 || true)
+[[ -n "$PLAIN_IDX_NIBBLE_OFFSET" ]] || fail "hex-паттерн не найден в обычном индексе $PLAIN_IDX_RELPATH"
+echo "  ✓ PLAIN INDEX: hex-паттерн найден"
+
+if hexdump -v -e '/1 "%02x"' "$ENC_IDX_FILE" | grep -q -i "$SENTINEL_HEX"; then
+  fail "hex-паттерн найден в зашифрованном индексе $ENC_IDX_RELPATH"
+fi
+echo "  ✓ ENCRYPTED INDEX: hex-паттерн отсутствует"
 echo ""
 
 echo ""

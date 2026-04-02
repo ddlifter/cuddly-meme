@@ -5,6 +5,11 @@
 \set data_rows 10000
 \endif
 
+\if :{?with_index}
+\else
+\set with_index 0
+\endif
+
 DROP TABLE IF EXISTS t_simple_encrypted CASCADE;
 DROP TABLE IF EXISTS t_simple_plain CASCADE;
 DROP TABLE IF EXISTS t_simple_encrypted_write CASCADE;
@@ -38,3 +43,8 @@ SELECT i FROM generate_series(1, :data_rows) AS i;
 
 INSERT INTO t_simple_plain (id)
 SELECT i FROM generate_series(1, :data_rows) AS i;
+
+\if :with_index
+CREATE INDEX t_simple_encrypted_id_idx ON t_simple_encrypted(id);
+CREATE INDEX t_simple_plain_id_idx ON t_simple_plain(id);
+\endif

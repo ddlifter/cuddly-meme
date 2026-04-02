@@ -105,6 +105,7 @@ typedef struct {
 
 void opentde_ensure_keys_loaded(void);
 void opentde_install_md_hooks(void);
+void opentde_init_utility_hooks(void);
 void opentde_init_key_manager(void);
 bool opentde_load_key_file(void);
 bool opentde_reload_key_file(void);

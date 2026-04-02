@@ -13,13 +13,17 @@ PGDATA="${PGDATA:-$HOME/pg_data}"
 DATA_ROWS="${DATA_ROWS:-10000}"
 CLIENTS="${CLIENTS:-1}"
 THREADS="${THREADS:-1}"
+BENCH_TIME="${BENCH_TIME:-}"
+WITH_INDEX=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
     --help|-h)
-        echo "Usage: $0 [--db NAME] [--bin PATH] [--rows N] [--clients N] [--jobs N]"
+        echo "Usage: $0 [--db NAME] [--bin PATH] [--rows N] [--clients N] [--jobs N] [-T SEC|--time SEC] [--with-index]"
         echo "Examples:"
         echo "  $0 --rows 1000000 --clients 10 --jobs 10"
+        echo "  $0 --rows 1000000 --clients 10 --jobs 10 -T 30"
+        echo "  $0 --rows 1000000 --clients 10 --jobs 10 --with-index"
         echo "  $0 --db postgres --bin $HOME/diploma/pg_build/bin --rows 200000"
         exit 0
         ;;
@@ -37,6 +41,15 @@ while [[ $# -gt 0 ]]; do
         [[ $# -ge 2 ]] || { echo "--jobs requires a value" >&2; exit 1; }
         THREADS="$2"
         shift 2
+        ;;
+    -T|--time)
+        [[ $# -ge 2 ]] || { echo "$1 requires a value" >&2; exit 1; }
+        BENCH_TIME="$2"
+        shift 2
+        ;;
+    --with-index)
+        WITH_INDEX=1
+        shift
         ;;
     --db)
         [[ $# -ge 2 ]] || { echo "--db requires a value" >&2; exit 1; }
@@ -58,7 +71,7 @@ while [[ $# -gt 0 ]]; do
             shift
         else
             echo "Unknown option: $1" >&2
-            echo "Usage: $0 [--db NAME] [--bin PATH] [--rows N] [--clients N] [--jobs N]" >&2
+            echo "Usage: $0 [--db NAME] [--bin PATH] [--rows N] [--clients N] [--jobs N] [-T SEC|--time SEC] [--with-index]" >&2
             exit 1
         fi
         ;;
@@ -85,14 +98,23 @@ run_case() {
     local label="$2"
     local script_file="$3"
     local tx_per_client
+    local mode_info
     local raw
 
     # pgbench -t is per client; split total target operations across clients.
     tx_per_client=$(( (DATA_ROWS + CLIENTS - 1) / CLIENTS ))
 
-    echo "[simple] ${section}/${label}: running pgbench..."
-    raw=$("$PGBENCH" -n -d "$DBNAME" -c "$CLIENTS" -j "$THREADS" -t "$tx_per_client" \
-        -f "$script_file" 2>&1)
+    if [[ -n "$BENCH_TIME" ]]; then
+        mode_info="time=${BENCH_TIME}s"
+        echo "[simple] ${section}/${label}: running pgbench (${mode_info})..."
+        raw=$("$PGBENCH" -n -d "$DBNAME" -c "$CLIENTS" -j "$THREADS" -T "$BENCH_TIME" -D max_id="$DATA_ROWS" \
+            -f "$script_file" 2>&1)
+    else
+        mode_info="rows=${DATA_ROWS} total"
+        echo "[simple] ${section}/${label}: running pgbench (${mode_info})..."
+        raw=$("$PGBENCH" -n -d "$DBNAME" -c "$CLIENTS" -j "$THREADS" -t "$tx_per_client" -D max_id="$DATA_ROWS" \
+            -f "$script_file" 2>&1)
+    fi
 
     echo "[simple] ${section}/${label}: raw output:"
     echo "$raw"
@@ -108,10 +130,16 @@ echo "  pgbin=$PGBIN"
 echo "  rows=$DATA_ROWS"
 echo "  clients=$CLIENTS"
 echo "  jobs=$THREADS"
+echo "  with_index=$WITH_INDEX"
+if [[ -n "$BENCH_TIME" ]]; then
+    echo "  mode=time ($BENCH_TIME s)"
+else
+    echo "  mode=rows (target total $DATA_ROWS)"
+fi
 
 echo "[simple] setup..."
 restart_with_preload
-"$PSQL" -d "$DBNAME" -v ON_ERROR_STOP=1 -v data_rows="$DATA_ROWS" -f "$SCRIPT_DIR/pgbench_simple_setup.sql"
+"$PSQL" -d "$DBNAME" -v ON_ERROR_STOP=1 -v data_rows="$DATA_ROWS" -v with_index="$WITH_INDEX" -f "$SCRIPT_DIR/pgbench_simple_setup.sql"
 
 echo ""
 echo "===== SIMPLE READ RESULT ====="

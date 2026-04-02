@@ -12,9 +12,17 @@ opentde_page_crypto_selftest(PG_FUNCTION_ARGS)
 #include "postgres.h"
 #include <stdbool.h>
 #include <stdio.h>
+#include "access/genam.h"
 #include "access/table.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_type_d.h"
+#include "commands/defrem.h"
+#include "nodes/parsenodes.h"
+#include "tcop/utility.h"
 #include "utils/array.h"
+#include "utils/lsyscache.h"
+#include "utils/relcache.h"
 #include <openssl/hmac.h>
 #include <string.h>
 
@@ -32,17 +40,241 @@ PG_FUNCTION_INFO_V1(opentde_blind_bucket_tokens_int8);
 
 #define OPENTDE_MAX_BUCKET_TOKEN_COUNT 65536
 
-static Oid
-opentde_relation_storage_oid(Oid relation_oid)
+static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
+static bool opentde_utility_hook_installed = false;
+
+static bool
+opentde_has_key_for_storage_oid(Oid storage_oid)
 {
+    int i;
+
+    if (!master_key_set || !global_key_mgr)
+        return false;
+
+    for (i = 0; i < global_key_mgr->key_count; i++)
+    {
+        if (global_key_mgr->keys[i].table_oid == storage_oid)
+            return true;
+    }
+
+    return false;
+}
+
+static Oid
+opentde_relation_storage_oid_locked(Oid relation_oid, LOCKMODE lockmode)
+{
+    char     relkind;
     Relation rel;
     Oid      storage_oid;
 
-    rel = table_open(relation_oid, AccessShareLock);
-    storage_oid = rel->rd_locator.relNumber;
-    table_close(rel, AccessShareLock);
+    relkind = get_rel_relkind(relation_oid);
+    if (relkind == RELKIND_INDEX)
+    {
+        rel = index_open(relation_oid, lockmode);
+        storage_oid = rel->rd_locator.relNumber;
+        index_close(rel, lockmode);
+    }
+    else
+    {
+        rel = table_open(relation_oid, lockmode);
+        storage_oid = rel->rd_locator.relNumber;
+        table_close(rel, lockmode);
+    }
 
     return storage_oid;
+}
+
+static Oid
+opentde_relation_storage_oid(Oid relation_oid)
+{
+    return opentde_relation_storage_oid_locked(relation_oid, AccessShareLock);
+}
+
+static void
+opentde_enable_relation_storage_key(Oid relation_oid)
+{
+    Oid storage_oid;
+
+    storage_oid = opentde_relation_storage_oid(relation_oid);
+    (void) opentde_get_active_table_key_version(storage_oid);
+}
+
+static void
+opentde_disable_relation_storage_key(Oid relation_oid)
+{
+    Oid storage_oid;
+
+    storage_oid = opentde_relation_storage_oid(relation_oid);
+    opentde_forget_table_keys(storage_oid);
+}
+
+static bool
+opentde_is_relation_encrypted(Oid relation_oid)
+{
+    Oid storage_oid;
+
+    storage_oid = opentde_relation_storage_oid(relation_oid);
+    return opentde_has_key_for_storage_oid(storage_oid);
+}
+
+static void
+opentde_enable_table_family_encryption(Oid table_oid)
+{
+    Relation rel;
+    List    *index_list;
+    ListCell *lc;
+
+    rel = table_open(table_oid, AccessShareLock);
+
+    if (rel->rd_rel->relkind != RELKIND_RELATION &&
+        rel->rd_rel->relkind != RELKIND_MATVIEW)
+    {
+        table_close(rel, AccessShareLock);
+        ereport(ERROR,
+                (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                 errmsg("relation %u is not a plain table", table_oid)));
+    }
+
+    (void) opentde_get_active_table_key_version(rel->rd_locator.relNumber);
+
+    if (OidIsValid(rel->rd_rel->reltoastrelid))
+        opentde_enable_relation_storage_key(rel->rd_rel->reltoastrelid);
+
+    index_list = RelationGetIndexList(rel);
+    foreach(lc, index_list)
+    {
+        Oid index_oid = lfirst_oid(lc);
+
+        opentde_enable_relation_storage_key(index_oid);
+    }
+
+    list_free(index_list);
+    table_close(rel, AccessShareLock);
+}
+
+static void
+opentde_disable_table_family_encryption(Oid table_oid)
+{
+    Relation rel;
+    List    *index_list;
+    ListCell *lc;
+
+    rel = table_open(table_oid, AccessShareLock);
+
+    if (rel->rd_rel->relkind != RELKIND_RELATION &&
+        rel->rd_rel->relkind != RELKIND_MATVIEW)
+    {
+        table_close(rel, AccessShareLock);
+        ereport(ERROR,
+                (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                 errmsg("relation %u is not a plain table", table_oid)));
+    }
+
+    opentde_forget_table_keys(rel->rd_locator.relNumber);
+
+    if (OidIsValid(rel->rd_rel->reltoastrelid))
+        opentde_disable_relation_storage_key(rel->rd_rel->reltoastrelid);
+
+    index_list = RelationGetIndexList(rel);
+    foreach(lc, index_list)
+    {
+        Oid index_oid = lfirst_oid(lc);
+
+        opentde_disable_relation_storage_key(index_oid);
+    }
+
+    list_free(index_list);
+    table_close(rel, AccessShareLock);
+}
+
+static void
+opentde_maybe_encrypt_indexes_for_table(Oid table_oid)
+{
+    Relation rel;
+    List    *index_list;
+    ListCell *lc;
+
+    rel = table_open(table_oid, AccessShareLock);
+    index_list = RelationGetIndexList(rel);
+
+    foreach(lc, index_list)
+    {
+        Oid index_oid = lfirst_oid(lc);
+
+        if (!opentde_is_relation_encrypted(index_oid))
+            opentde_enable_relation_storage_key(index_oid);
+    }
+
+    list_free(index_list);
+    table_close(rel, AccessShareLock);
+}
+
+static void
+opentde_ProcessUtility(PlannedStmt *pstmt,
+                       const char *queryString,
+                       bool readOnlyTree,
+                       ProcessUtilityContext context,
+                       ParamListInfo params,
+                       QueryEnvironment *queryEnv,
+                       DestReceiver *dest,
+                       QueryCompletion *qc)
+{
+    Node *parsetree = pstmt->utilityStmt;
+
+    if (prev_ProcessUtility_hook)
+        prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree,
+                                 context, params, queryEnv, dest, qc);
+    else
+        standard_ProcessUtility(pstmt, queryString, readOnlyTree,
+                                context, params, queryEnv, dest, qc);
+
+    if (!master_key_set)
+        return;
+
+    if (IsA(parsetree, IndexStmt))
+    {
+        IndexStmt *stmt = (IndexStmt *) parsetree;
+        Oid        table_oid;
+
+        if (stmt->relation == NULL)
+            return;
+
+        table_oid = RangeVarGetRelid(stmt->relation, NoLock, true);
+        if (!OidIsValid(table_oid))
+            return;
+
+        if (opentde_is_relation_encrypted(table_oid))
+            opentde_maybe_encrypt_indexes_for_table(table_oid);
+
+        return;
+    }
+
+    if (IsA(parsetree, ReindexStmt))
+    {
+        ReindexStmt *stmt = (ReindexStmt *) parsetree;
+        Oid          table_oid;
+
+        if (stmt->kind != REINDEX_OBJECT_TABLE || stmt->relation == NULL)
+            return;
+
+        table_oid = RangeVarGetRelid(stmt->relation, NoLock, true);
+        if (!OidIsValid(table_oid))
+            return;
+
+        if (opentde_is_relation_encrypted(table_oid))
+            opentde_maybe_encrypt_indexes_for_table(table_oid);
+    }
+}
+
+void
+opentde_init_utility_hooks(void)
+{
+    if (opentde_utility_hook_installed)
+        return;
+
+    prev_ProcessUtility_hook = ProcessUtility_hook;
+    ProcessUtility_hook = opentde_ProcessUtility;
+    opentde_utility_hook_installed = true;
 }
 
 /* Floor division для int64 и положительного делителя. */
@@ -157,10 +389,8 @@ Datum
 opentde_enable_table_encryption(PG_FUNCTION_ARGS)
 {
     Oid table_oid;
-    Oid storage_oid;
 
     table_oid = PG_GETARG_OID(0);
-    storage_oid = opentde_relation_storage_oid(table_oid);
 
     opentde_init_key_manager();
 
@@ -171,7 +401,7 @@ opentde_enable_table_encryption(PG_FUNCTION_ARGS)
                  errmsg("master key is not set")));
     }
 
-    (void) opentde_get_active_table_key_version(storage_oid);
+    opentde_enable_table_family_encryption(table_oid);
 
     PG_RETURN_VOID();
 }
@@ -183,10 +413,8 @@ Datum
 opentde_disable_table_encryption(PG_FUNCTION_ARGS)
 {
     Oid table_oid;
-    Oid storage_oid;
 
     table_oid = PG_GETARG_OID(0);
-    storage_oid = opentde_relation_storage_oid(table_oid);
 
     opentde_init_key_manager();
 
@@ -197,7 +425,7 @@ opentde_disable_table_encryption(PG_FUNCTION_ARGS)
                  errmsg("master key is not set")));
     }
 
-    opentde_forget_table_keys(storage_oid);
+    opentde_disable_table_family_encryption(table_oid);
 
     PG_RETURN_VOID();
 }

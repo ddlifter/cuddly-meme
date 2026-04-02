@@ -315,5 +315,8 @@ void
 _PG_init(void)
 {
     if (process_shared_preload_libraries_in_progress && !IsUnderPostmaster)
+    {
         opentde_install_md_hooks();
+        opentde_init_utility_hooks();
+    }
 }
