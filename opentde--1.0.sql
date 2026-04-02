@@ -7,6 +7,16 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'opentde_set_master_key'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION opentde_enable_table_encryption(oid)
+RETURNS void
+AS 'MODULE_PATHNAME', 'opentde_enable_table_encryption'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION opentde_disable_table_encryption(oid)
+RETURNS void
+AS 'MODULE_PATHNAME', 'opentde_disable_table_encryption'
+LANGUAGE C STRICT;
+
 CREATE FUNCTION opentde_rotate_master_key(bytea)
 RETURNS int4
 AS 'MODULE_PATHNAME', 'opentde_rotate_master_key'
@@ -17,19 +27,10 @@ RETURNS int4
 AS 'MODULE_PATHNAME', 'opentde_rotate_table_dek_sql'
 LANGUAGE C STRICT;
 
-
-CREATE FUNCTION opentde_pageam_handler(internal)
-RETURNS table_am_handler
-AS 'MODULE_PATHNAME', 'opentde_pageam_handler'
-LANGUAGE C STRICT;
-
 CREATE FUNCTION opentde_page_crypto_selftest(oid, int4, bytea)
 RETURNS void
 AS 'MODULE_PATHNAME', 'opentde_page_crypto_selftest'
 LANGUAGE C STRICT;
-
-
-CREATE ACCESS METHOD tde TYPE TABLE HANDLER opentde_pageam_handler;
 
 -- Blind index: HMAC-SHA256(master_key, value).
 -- Файл индекса хранит только HMAC-дайджесты, а не открытые значения.

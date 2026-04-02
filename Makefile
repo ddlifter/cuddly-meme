@@ -6,8 +6,8 @@ DATA = opentde--1.0.sql
 MODULE_big = opentde
 # Список исходников для компиляции
 
-OBJS = src/kuznechik.o src/opentde_crypto.o src/opentde_keymanager.o src/opentde_sql.o src/pg_encrypted_smgr.o src/opentde_pageam.o src/opentde_pagestore.o
-SRCS = src/kuznechik.c src/opentde_crypto.c src/opentde_keymanager.c src/opentde_sql.c src/pg_encrypted_smgr.c src/opentde_pageam.c src/opentde_pagestore.c
+OBJS = src/kuznechik.o src/opentde_crypto.o src/opentde_keymanager.o src/opentde_sql.o src/pg_encrypted_smgr.o src/opentde_pagestore.o
+SRCS = src/kuznechik.c src/opentde_crypto.c src/opentde_keymanager.c src/opentde_sql.c src/pg_encrypted_smgr.c src/opentde_pagestore.c
 
 # Подключаем конфигурацию PostgreSQL
 PG_CONFIG = /home/ddlifter/diploma/pg_build/bin/pg_config

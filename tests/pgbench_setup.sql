@@ -18,7 +18,8 @@ CREATE TABLE t_encrypted (
   id   bigint,
   name text,
   balance integer
-) USING tde;
+);
+SELECT opentde_enable_table_encryption('t_encrypted'::regclass);
 
 -- Обычная таблица (Heap)
 CREATE TABLE t_plain (
@@ -33,7 +34,8 @@ CREATE TABLE t_encrypted_write (
   id   bigint,
   name text,
   balance integer
-) USING tde;
+);
+SELECT opentde_enable_table_encryption('t_encrypted_write'::regclass);
 
 CREATE TABLE t_plain_write (
   id   bigint,

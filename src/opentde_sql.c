@@ -12,12 +12,15 @@ opentde_page_crypto_selftest(PG_FUNCTION_ARGS)
 #include "postgres.h"
 #include <stdbool.h>
 #include <stdio.h>
+#include "access/table.h"
 #include "catalog/pg_type_d.h"
 #include "utils/array.h"
 #include <openssl/hmac.h>
 #include <string.h>
 
 PG_FUNCTION_INFO_V1(opentde_set_master_key);
+PG_FUNCTION_INFO_V1(opentde_enable_table_encryption);
+PG_FUNCTION_INFO_V1(opentde_disable_table_encryption);
 PG_FUNCTION_INFO_V1(opentde_rotate_master_key);
 PG_FUNCTION_INFO_V1(opentde_rotate_table_dek_sql);
 PG_FUNCTION_INFO_V1(opentde_debug_keys);
@@ -28,6 +31,19 @@ PG_FUNCTION_INFO_V1(opentde_blind_bucket_int8);
 PG_FUNCTION_INFO_V1(opentde_blind_bucket_tokens_int8);
 
 #define OPENTDE_MAX_BUCKET_TOKEN_COUNT 65536
+
+static Oid
+opentde_relation_storage_oid(Oid relation_oid)
+{
+    Relation rel;
+    Oid      storage_oid;
+
+    rel = table_open(relation_oid, AccessShareLock);
+    storage_oid = rel->rd_locator.relNumber;
+    table_close(rel, AccessShareLock);
+
+    return storage_oid;
+}
 
 /* Floor division для int64 и положительного делителя. */
 static int64
@@ -101,6 +117,7 @@ opentde_set_master_key(PG_FUNCTION_ARGS)
     uint8_t *new_key;
     int    key_len;
 
+    elog(WARNING, "[OpenTDE] opentde_set_master_key start");
     key_data = PG_GETARG_BYTEA_P(0);
     key_len  = VARSIZE_ANY_EXHDR(key_data);
     new_key  = (uint8_t *) VARDATA_ANY(key_data);
@@ -118,6 +135,9 @@ opentde_set_master_key(PG_FUNCTION_ARGS)
 
     memcpy(global_key_mgr->master_key, new_key, MASTER_KEY_SIZE);
     master_key_set = true;
+    elog(WARNING, "[OpenTDE] master key copied, installing hooks");
+    opentde_install_md_hooks();
+    elog(WARNING, "[OpenTDE] hooks installed");
 
     /* Сохранение ключа и загрузка существующих DEK/IV */
     opentde_save_master_key_to_file();
@@ -126,6 +146,59 @@ opentde_set_master_key(PG_FUNCTION_ARGS)
     elog(DEBUG1,
          "[OpenTDE] Master key set and %d keys loaded+decrypted",
          global_key_mgr->key_count);
+    PG_RETURN_VOID();
+}
+
+/*
+ * Делает обычную heap-таблицу шифрованной на storage level.
+ * Фактическое шифрование начнется при первом обращении smgr к relation.
+ */
+Datum
+opentde_enable_table_encryption(PG_FUNCTION_ARGS)
+{
+    Oid table_oid;
+    Oid storage_oid;
+
+    table_oid = PG_GETARG_OID(0);
+    storage_oid = opentde_relation_storage_oid(table_oid);
+
+    opentde_init_key_manager();
+
+    if (!master_key_set)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("master key is not set")));
+    }
+
+    (void) opentde_get_active_table_key_version(storage_oid);
+
+    PG_RETURN_VOID();
+}
+
+/*
+ * Убирает relation из списка шифруемых таблиц.
+ */
+Datum
+opentde_disable_table_encryption(PG_FUNCTION_ARGS)
+{
+    Oid table_oid;
+    Oid storage_oid;
+
+    table_oid = PG_GETARG_OID(0);
+    storage_oid = opentde_relation_storage_oid(table_oid);
+
+    opentde_init_key_manager();
+
+    if (!master_key_set)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("master key is not set")));
+    }
+
+    opentde_forget_table_keys(storage_oid);
+
     PG_RETURN_VOID();
 }
 
@@ -188,8 +261,10 @@ opentde_rotate_table_dek_sql(PG_FUNCTION_ARGS)
 {
     Oid      table_oid;
     uint32_t new_version;
+    Oid      storage_oid;
 
     table_oid = PG_GETARG_OID(0);
+    storage_oid = opentde_relation_storage_oid(table_oid);
 
     opentde_init_key_manager();
 
@@ -203,7 +278,7 @@ opentde_rotate_table_dek_sql(PG_FUNCTION_ARGS)
     if (global_key_mgr->key_count == 0)
         opentde_load_key_file();
 
-    new_version = opentde_rotate_table_dek(table_oid);
+    new_version = opentde_rotate_table_dek(storage_oid);
     PG_RETURN_INT32((int32) new_version);
 }
 
@@ -251,12 +326,14 @@ Datum
 opentde_get_dek_hex(PG_FUNCTION_ARGS)
 {
     Oid              table_oid;
+    Oid              storage_oid;
     uint8_t         *dek;
     StringInfoData   buf;
     int              i;
 
     table_oid = PG_GETARG_OID(0);
-    dek = opentde_get_table_dek(table_oid);
+    storage_oid = opentde_relation_storage_oid(table_oid);
+    dek = opentde_get_table_dek(storage_oid);
 
     initStringInfo(&buf);
     for (i = 0; i < DEK_SIZE; i++)

@@ -1,6 +1,7 @@
 #include <curl/curl.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 
 // Вспомогательная функция для записи ответа libcurl в буфер
 static size_t curl_write_cb(void *contents, size_t size, size_t nmemb, void *userp) {
@@ -26,6 +27,21 @@ static size_t curl_write_cb(void *contents, size_t size, size_t nmemb, void *use
  */
 opentde_key_manager *global_key_mgr = NULL; // Define the global key manager pointer (was only declared as extern)
 bool master_key_set = false; // Define the global master key set flag (was only declared as extern)
+
+static time_t key_file_last_mtime = 0;
+static off_t key_file_last_size = 0;
+
+static void
+opentde_record_key_file_signature(const char *key_path)
+{
+    struct stat st;
+
+    if (stat(key_path, &st) == 0)
+    {
+        key_file_last_mtime = st.st_mtime;
+        key_file_last_size = st.st_size;
+    }
+}
 void opentde_ensure_keys_loaded(void)
 {
     if (!master_key_set) {
@@ -104,6 +120,27 @@ opentde_getenv_or_default(const char *name, const char *default_value)
 {
     const char *value = getenv(name);
 
+    if (value && value[0] != '\0')
+        return value;
+
+    return default_value;
+}
+
+/*
+ * Берёт значение из нового имени переменной, а затем из legacy-алиаса.
+ * Это позволяет поддерживать оба варианта: OPENTDE_VAULT_* и VAULT_*.
+ */
+static const char *
+opentde_getenv_compat(const char *primary_name,
+                      const char *fallback_name,
+                      const char *default_value)
+{
+    const char *value = getenv(primary_name);
+
+    if (value && value[0] != '\0')
+        return value;
+
+    value = getenv(fallback_name);
     if (value && value[0] != '\0')
         return value;
 
@@ -314,8 +351,8 @@ opentde_vault_build_url(void)
 {
     const char *addr;
     const char *path;
-    addr = opentde_getenv_or_default("OPENTDE_VAULT_ADDR", OPENTDE_VAULT_ADDR_DEFAULT);
-    path = opentde_getenv_or_default("OPENTDE_VAULT_PATH", OPENTDE_VAULT_PATH_DEFAULT);
+    addr = opentde_getenv_compat("OPENTDE_VAULT_ADDR", "VAULT_ADDR", OPENTDE_VAULT_ADDR_DEFAULT);
+    path = opentde_getenv_compat("OPENTDE_VAULT_PATH", "VAULT_PATH", OPENTDE_VAULT_PATH_DEFAULT);
     if (strncmp(path, "secret/data/", 12) == 0)
         return psprintf("%s/v1/%s", addr, path);
     else if (strncmp(path, "secret/", 7) == 0)
@@ -332,10 +369,10 @@ opentde_vault_http_request(const char *method,
                            long *http_code_out,
                            char **response_out)
 {
-    const char *token = opentde_getenv_or_default("OPENTDE_VAULT_TOKEN", OPENTDE_VAULT_TOKEN_DEFAULT);
-    const char *addr = opentde_getenv_or_default("OPENTDE_VAULT_ADDR", OPENTDE_VAULT_ADDR_DEFAULT);
-    const char *path = opentde_getenv_or_default("OPENTDE_VAULT_PATH", OPENTDE_VAULT_PATH_DEFAULT);
-    const char *field = opentde_getenv_or_default("OPENTDE_VAULT_FIELD", OPENTDE_VAULT_FIELD_DEFAULT);
+    const char *token = opentde_getenv_compat("OPENTDE_VAULT_TOKEN", "VAULT_TOKEN", OPENTDE_VAULT_TOKEN_DEFAULT);
+    const char *addr = opentde_getenv_compat("OPENTDE_VAULT_ADDR", "VAULT_ADDR", OPENTDE_VAULT_ADDR_DEFAULT);
+    const char *path = opentde_getenv_compat("OPENTDE_VAULT_PATH", "VAULT_PATH", OPENTDE_VAULT_PATH_DEFAULT);
+    const char *field = opentde_getenv_compat("OPENTDE_VAULT_FIELD", "VAULT_FIELD", OPENTDE_VAULT_FIELD_DEFAULT);
     elog(WARNING, "[OpenTDE] Vault ENV: ADDR='%s' PATH='%s' FIELD='%s' TOKEN='%s'", addr, path, field, token);
     bool ok = false;
 
@@ -597,8 +634,19 @@ opentde_load_key_file(void)
 
     close(fd);
     elog(DEBUG1, "[OpenTDE] Loaded %d keys from %s", entries_read, key_path);
+    opentde_record_key_file_signature(key_path);
     pfree(key_path);
     return true;
+}
+
+bool
+opentde_reload_key_file(void)
+{
+    if (!master_key_set || !global_key_mgr)
+        return false;
+
+    global_key_mgr->key_count = 0;
+    return opentde_load_key_file();
 }
 
 /*
@@ -673,6 +721,51 @@ opentde_save_key_file(void)
     pfree(key_path);
 }
 
+/*
+ * Удаляет все DEK-записи для указанной таблицы из key ring.
+ * Используется при явном выключении шифрования для relation.
+ */
+void
+opentde_forget_table_keys(Oid table_oid)
+{
+    int  read_idx;
+    int  write_idx;
+    bool changed;
+
+    opentde_ensure_keys_loaded();
+
+    if (!master_key_set || !global_key_mgr)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("master key is not set")));
+    }
+
+    changed = false;
+    write_idx = 0;
+
+    for (read_idx = 0; read_idx < global_key_mgr->key_count; read_idx++)
+    {
+        opentde_key_entry *entry = &global_key_mgr->keys[read_idx];
+
+        if (entry->table_oid == table_oid)
+        {
+            changed = true;
+            continue;
+        }
+
+        if (write_idx != read_idx)
+            global_key_mgr->keys[write_idx] = *entry;
+        write_idx++;
+    }
+
+    if (!changed)
+        return;
+
+    global_key_mgr->key_count = write_idx;
+    opentde_save_key_file();
+}
+
 
 
 
@@ -699,9 +792,9 @@ opentde_load_master_key_from_file(void)
     uint8_t     key[MASTER_KEY_SIZE];
 
     url = opentde_vault_build_url();
-    field_name = opentde_getenv_or_default("OPENTDE_VAULT_FIELD", OPENTDE_VAULT_FIELD_DEFAULT);
+    field_name = opentde_getenv_compat("OPENTDE_VAULT_FIELD", "VAULT_FIELD", OPENTDE_VAULT_FIELD_DEFAULT);
     elog(WARNING, "[OpenTDE] Using VAULT_FIELD='%s'", field_name);
-    vault_path = opentde_getenv_or_default("OPENTDE_VAULT_PATH", OPENTDE_VAULT_PATH_DEFAULT);
+    vault_path = opentde_getenv_compat("OPENTDE_VAULT_PATH", "VAULT_PATH", OPENTDE_VAULT_PATH_DEFAULT);
 
     ok = opentde_vault_http_request("GET", url, NULL, &http_code, &response);
     pfree(url);
@@ -751,6 +844,7 @@ opentde_load_master_key_from_file(void)
     opentde_init_key_manager();
     memcpy(global_key_mgr->master_key, key, MASTER_KEY_SIZE);
     master_key_set = true;
+    opentde_install_md_hooks();
 
     elog(DEBUG1, "[OpenTDE] Master key auto-loaded from Vault path %s", vault_path);
     return true;
@@ -777,8 +871,8 @@ opentde_save_master_key_to_file(void)
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("key manager is not initialized")));
 
-    field_name = opentde_getenv_or_default("OPENTDE_VAULT_FIELD", OPENTDE_VAULT_FIELD_DEFAULT);
-    vault_path = opentde_getenv_or_default("OPENTDE_VAULT_PATH", OPENTDE_VAULT_PATH_DEFAULT);
+    field_name = opentde_getenv_compat("OPENTDE_VAULT_FIELD", "VAULT_FIELD", OPENTDE_VAULT_FIELD_DEFAULT);
+    vault_path = opentde_getenv_compat("OPENTDE_VAULT_PATH", "VAULT_PATH", OPENTDE_VAULT_PATH_DEFAULT);
 
     opentde_bytes_to_hex(global_key_mgr->master_key, MASTER_KEY_SIZE, key_hex);
 

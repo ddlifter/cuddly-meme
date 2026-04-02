@@ -10,7 +10,8 @@ SELECT opentde_set_master_key(decode('00112233445566778899aabbccddeeff0011223344
 
 CREATE TABLE t_simple_encrypted (
   id int
-) USING tde;
+);
+SELECT opentde_enable_table_encryption('t_simple_encrypted'::regclass);
 
 CREATE TABLE t_simple_plain (
   id int

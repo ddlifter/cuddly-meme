@@ -104,13 +104,16 @@ typedef struct {
 } key_file_entry;
 
 void opentde_ensure_keys_loaded(void);
+void opentde_install_md_hooks(void);
 void opentde_init_key_manager(void);
 bool opentde_load_key_file(void);
+bool opentde_reload_key_file(void);
 bool opentde_load_master_key_from_file(void);
 void opentde_save_master_key_to_file(void);
 void opentde_ensure_key_directory(void);
 char *opentde_get_pgdata_path(void);
 void opentde_save_key_file(void);
+void opentde_forget_table_keys(Oid table_oid);
 
 
 

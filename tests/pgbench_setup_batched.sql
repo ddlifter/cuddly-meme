@@ -18,7 +18,8 @@ CREATE TABLE t_encrypted (
   balance integer,
   email text,
   data text
-) USING tde;
+);
+SELECT opentde_enable_table_encryption('t_encrypted'::regclass);
 
 -- Обычная таблица (Heap)
 CREATE TABLE t_plain (
