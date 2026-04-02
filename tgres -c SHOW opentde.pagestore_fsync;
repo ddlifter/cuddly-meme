@@ -1,5 +1,0 @@
-  name   | default_version | installed_version |                     comment                     
----------+-----------------+-------------------+-------------------------------------------------
- opentde | 1.0             | 1.0               | Open Transparent Data Encryption for PostgreSQL
-(1 row)
-

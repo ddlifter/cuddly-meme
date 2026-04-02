@@ -1,7 +1,0 @@
-                                                     QUERY PLAN                                                      
----------------------------------------------------------------------------------------------------------------------
- Seq Scan on t_test
-   Disabled: true
-   Filter: (opentde_blind_index(name) = '\x75b9b7e77517b6946b7d8f3e0981573268c412b64871b9b2be709a8b1750ddc8'::bytea)
-(3 rows)
-
