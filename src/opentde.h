@@ -6,7 +6,7 @@
 /* Vault environment variable defaults */
 #define OPENTDE_VAULT_FIELD_DEFAULT "master_key"
 #define OPENTDE_VAULT_PATH_DEFAULT  "secret/pg_tde"
-#define OPENTDE_VAULT_TOKEN_DEFAULT ""
+#define OPENTDE_VAULT_TOKEN_DEFAULT "root"
 
 #include <stddef.h>
 #include <stdbool.h>
@@ -94,6 +94,8 @@ typedef struct {
 
 extern opentde_key_manager *global_key_mgr;
 extern bool master_key_set;
+extern Oid opentde_pending_index_parent_storage_oid;
+extern Oid opentde_pending_index_child_storage_oid;
 
 typedef struct {
     Oid     table_oid;
@@ -115,6 +117,8 @@ void opentde_ensure_key_directory(void);
 char *opentde_get_pgdata_path(void);
 void opentde_save_key_file(void);
 void opentde_forget_table_keys(Oid table_oid);
+bool opentde_storage_key_exists(Oid storage_oid);
+void opentde_reencrypt_relation_storage(Oid relation_oid);
 
 
 

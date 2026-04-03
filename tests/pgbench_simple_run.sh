@@ -16,6 +16,20 @@ THREADS="${THREADS:-1}"
 BENCH_TIME="${BENCH_TIME:-}"
 WITH_INDEX=0
 
+# --- Vault environment variables (aligned with e2e_tde_check.sh) ---
+export VAULT_ADDR="${VAULT_ADDR:-${OPENTDE_VAULT_ADDR:-http://127.0.0.1:8200}}"
+export VAULT_PATH="${VAULT_PATH:-${OPENTDE_VAULT_PATH:-secret/pg_tde}}"
+export VAULT_FIELD="${VAULT_FIELD:-${OPENTDE_VAULT_FIELD:-master_key}}"
+export VAULT_TOKEN="${VAULT_TOKEN:-${OPENTDE_VAULT_TOKEN:-root}}"
+export OPENTDE_VAULT_ADDR="${OPENTDE_VAULT_ADDR:-$VAULT_ADDR}"
+export OPENTDE_VAULT_PATH="${OPENTDE_VAULT_PATH:-$VAULT_PATH}"
+export OPENTDE_VAULT_FIELD="${OPENTDE_VAULT_FIELD:-$VAULT_FIELD}"
+export OPENTDE_VAULT_TOKEN="${OPENTDE_VAULT_TOKEN:-$VAULT_TOKEN}"
+
+if [[ -z "${VAULT_TOKEN:-}" ]]; then
+    echo "[simple][WARN] VAULT_TOKEN is not set. Defaulting to local Vault dev token 'root'."
+fi
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
     --help|-h)
@@ -85,7 +99,7 @@ restart_with_preload() {
     local pg_ctl="$PGBIN/pg_ctl"
 
     "$pg_ctl" -D "$PGDATA" stop -m fast -w >/dev/null 2>&1 || true
-    "$pg_ctl" -D "$PGDATA" start -w -o "-c shared_preload_libraries=opentde" >/dev/null
+    "$pg_ctl" -D "$PGDATA" start -w -o "-c shared_preload_libraries=opentde -c io_method=sync" >/dev/null
 }
 
 extract_metrics() {
@@ -131,6 +145,14 @@ echo "  rows=$DATA_ROWS"
 echo "  clients=$CLIENTS"
 echo "  jobs=$THREADS"
 echo "  with_index=$WITH_INDEX"
+echo "  vault_addr=$VAULT_ADDR"
+echo "  vault_path=$VAULT_PATH"
+echo "  vault_field=$VAULT_FIELD"
+if [[ -n "${VAULT_TOKEN:-}" ]]; then
+    echo "  vault_token=<set>"
+else
+    echo "  vault_token=<empty>"
+fi
 if [[ -n "$BENCH_TIME" ]]; then
     echo "  mode=time ($BENCH_TIME s)"
 else

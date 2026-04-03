@@ -30,6 +30,8 @@ bool master_key_set = false; // Define the global master key set flag (was only 
 
 static time_t key_file_last_mtime = 0;
 static off_t key_file_last_size = 0;
+static int master_key_load_skip_calls = 0;
+static bool master_key_load_failed_logged = false;
 
 static void
 opentde_record_key_file_signature(const char *key_path)
@@ -44,19 +46,36 @@ opentde_record_key_file_signature(const char *key_path)
 }
 void opentde_ensure_keys_loaded(void)
 {
-    if (!master_key_set) {
-        elog(WARNING, "[OpenTDE] ensure_keys_loaded: master_key_set is false, trying to load from Vault");
-        if (opentde_load_master_key_from_file()) {
-            master_key_set = true;
-            elog(WARNING, "[OpenTDE] ensure_keys_loaded: master_key_set is now true");
-            if (!global_key_mgr)
-                opentde_init_key_manager();
-            opentde_load_key_file();
-        } else {
-            elog(WARNING, "[OpenTDE] ensure_keys_loaded: failed to load master key from Vault");
+    if (master_key_set)
+        return;
+
+    if (master_key_load_skip_calls > 0)
+    {
+        master_key_load_skip_calls--;
+        return;
+    }
+
+    if (opentde_load_master_key_from_file())
+    {
+        master_key_set = true;
+        master_key_load_skip_calls = 0;
+        master_key_load_failed_logged = false;
+
+        if (!global_key_mgr)
+            opentde_init_key_manager();
+        opentde_load_key_file();
+    }
+    else
+    {
+        if (!master_key_load_failed_logged)
+        {
+            elog(LOG,
+                 "[OpenTDE] master key is unavailable from Vault; suppressing repeated retries for this backend");
+            master_key_load_failed_logged = true;
         }
-    } else {
-        elog(WARNING, "[OpenTDE] ensure_keys_loaded: master_key_set is already true");
+
+        /* Avoid hammering Vault and log spam on every tuple/page access. */
+        master_key_load_skip_calls = 256;
     }
 }
 #include "port.h"
@@ -370,10 +389,6 @@ opentde_vault_http_request(const char *method,
                            char **response_out)
 {
     const char *token = opentde_getenv_compat("OPENTDE_VAULT_TOKEN", "VAULT_TOKEN", OPENTDE_VAULT_TOKEN_DEFAULT);
-    const char *addr = opentde_getenv_compat("OPENTDE_VAULT_ADDR", "VAULT_ADDR", OPENTDE_VAULT_ADDR_DEFAULT);
-    const char *path = opentde_getenv_compat("OPENTDE_VAULT_PATH", "VAULT_PATH", OPENTDE_VAULT_PATH_DEFAULT);
-    const char *field = opentde_getenv_compat("OPENTDE_VAULT_FIELD", "VAULT_FIELD", OPENTDE_VAULT_FIELD_DEFAULT);
-    elog(WARNING, "[OpenTDE] Vault ENV: ADDR='%s' PATH='%s' FIELD='%s' TOKEN='%s'", addr, path, field, token);
     bool ok = false;
 
     *http_code_out = 0;
@@ -402,7 +417,7 @@ opentde_vault_http_request(const char *method,
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L); // Включить подробный вывод для диагностики
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
 
     if (payload && strcmp(method, "GET") != 0) {
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
@@ -793,7 +808,6 @@ opentde_load_master_key_from_file(void)
 
     url = opentde_vault_build_url();
     field_name = opentde_getenv_compat("OPENTDE_VAULT_FIELD", "VAULT_FIELD", OPENTDE_VAULT_FIELD_DEFAULT);
-    elog(WARNING, "[OpenTDE] Using VAULT_FIELD='%s'", field_name);
     vault_path = opentde_getenv_compat("OPENTDE_VAULT_PATH", "VAULT_PATH", OPENTDE_VAULT_PATH_DEFAULT);
 
     ok = opentde_vault_http_request("GET", url, NULL, &http_code, &response);
@@ -801,7 +815,7 @@ opentde_load_master_key_from_file(void)
 
     if (!ok) 
     {
-        elog(WARNING, "[OpenTDE] Vault GET request failed while loading master key");
+        elog(DEBUG1, "[OpenTDE] Vault GET request failed while loading master key");
         return false;
     }
 
@@ -813,7 +827,7 @@ opentde_load_master_key_from_file(void)
 
     if (http_code != 200)
     {
-        elog(WARNING,
+        elog(DEBUG1,
              "[OpenTDE] Vault returned HTTP %ld while loading master key",
              http_code);
         free(response);

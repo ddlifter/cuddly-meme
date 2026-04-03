@@ -80,6 +80,24 @@ opentde_find_table_key_index(Oid table_oid, uint32_t key_version)
     return -1;
 }
 
+bool
+opentde_storage_key_exists(Oid storage_oid)
+{
+    int i;
+
+    opentde_ensure_keys_loaded();
+    if (!global_key_mgr)
+        return false;
+
+    for (i = 0; i < global_key_mgr->key_count; i++)
+    {
+        if (global_key_mgr->keys[i].table_oid == storage_oid)
+            return true;
+    }
+
+    return false;
+}
+
 /* Возвращает прямой указатель на DEK указанной версии без лишних аллокаций. */
 
 static const uint8_t *

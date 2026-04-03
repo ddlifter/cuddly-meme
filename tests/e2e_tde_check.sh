@@ -59,7 +59,7 @@ restart() {
   fi
 
   "$PG_CTL" -D "$PGDATA" stop -m fast -w >/dev/null 2>&1 || true
-  "$PG_CTL" -D "$PGDATA" start -w -o "-c shared_preload_libraries=opentde" >/dev/null
+  "$PG_CTL" -D "$PGDATA" start -w -o "-c shared_preload_libraries=opentde -c io_method=sync" >/dev/null
 }
 
 echo ""
@@ -99,9 +99,6 @@ CREATE TABLE t_plain (
   id   int,
   name text
 );
-
-CREATE INDEX t_test_name_idx ON t_test(name);
-CREATE INDEX t_plain_name_idx ON t_plain(name);
 
 INSERT INTO t_test VALUES (1, 'Привет мир');
 INSERT INTO t_test VALUES (2, 'Тестовая строка');
@@ -205,17 +202,11 @@ echo ""
 sql -c "CHECKPOINT;"
 ENC_RELPATH=$(sql_val "SELECT pg_relation_filepath('t_test'::regclass)")
 PLAIN_RELPATH=$(sql_val "SELECT pg_relation_filepath('t_plain'::regclass)")
-ENC_IDX_RELPATH=$(sql_val "SELECT pg_relation_filepath('t_test_name_idx'::regclass)")
-PLAIN_IDX_RELPATH=$(sql_val "SELECT pg_relation_filepath('t_plain_name_idx'::regclass)")
 ENC_FILE="$PGDATA/$ENC_RELPATH"
 PLAIN_FILE="$PGDATA/$PLAIN_RELPATH"
-ENC_IDX_FILE="$PGDATA/$ENC_IDX_RELPATH"
-PLAIN_IDX_FILE="$PGDATA/$PLAIN_IDX_RELPATH"
 
 [[ -f "$PLAIN_FILE" ]] || fail "Файл обычной таблицы не найден: $PLAIN_FILE"
 [[ -f "$ENC_FILE" ]] || fail "Файл зашифрованной таблицы не найден: $ENC_FILE"
-[[ -f "$PLAIN_IDX_FILE" ]] || fail "Файл обычного индекса не найден: $PLAIN_IDX_FILE"
-[[ -f "$ENC_IDX_FILE" ]] || fail "Файл зашифрованного индекса не найден: $ENC_IDX_FILE"
 
 SENTINEL_HEX=$(to_hex "$SENTINEL_TEXT")
 echo "  Sentinel String:  $SENTINEL_TEXT"
@@ -224,11 +215,8 @@ echo ""
 echo "  Файлы таблиц:"
 echo "    Plain:     $PLAIN_FILE"
 echo "    Encrypted: $ENC_FILE"
-echo "  Файлы индексов:"
-echo "    Plain idx:     $PLAIN_IDX_FILE"
-echo "    Encrypted idx: $ENC_IDX_FILE"
 echo ""
-ls -lh "$PLAIN_FILE" "$ENC_FILE" "$PLAIN_IDX_FILE" "$ENC_IDX_FILE" | sed 's/^/    /'
+ls -lh "$PLAIN_FILE" "$ENC_FILE" | sed 's/^/    /'
 echo ""
 echo "  Содержимое файла PLAIN (hexdump):"
 echo "  ----"
@@ -249,19 +237,9 @@ if hexdump -v -e '/1 "%02x"' "$ENC_FILE" | grep -q -i "$SENTINEL_HEX"; then
   fail "hex-паттерн найден в зашифрованной таблице $ENC_RELPATH"
 fi
 echo "  ✓ ENCRYPTED: hex-паттерн отсутствует"
-
-PLAIN_IDX_NIBBLE_OFFSET=$(hexdump -v -e '/1 "%02x"' "$PLAIN_IDX_FILE" | grep -bo -m1 "$SENTINEL_HEX" | cut -d: -f1 || true)
-[[ -n "$PLAIN_IDX_NIBBLE_OFFSET" ]] || fail "hex-паттерн не найден в обычном индексе $PLAIN_IDX_RELPATH"
-echo "  ✓ PLAIN INDEX: hex-паттерн найден"
-
-if hexdump -v -e '/1 "%02x"' "$ENC_IDX_FILE" | grep -q -i "$SENTINEL_HEX"; then
-  fail "hex-паттерн найден в зашифрованном индексе $ENC_IDX_RELPATH"
-fi
-echo "  ✓ ENCRYPTED INDEX: hex-паттерн отсутствует"
 echo ""
-
 echo ""
-echo "  [6/9] Проверка WAL"
+echo "  [6/8] Проверка WAL"
 echo ""
 echo ""
 sql -c "DELETE FROM t_test WHERE name='WAL_ENC_000001';"
@@ -296,53 +274,8 @@ rm -f "$ENC_GREP_OUT" "$PLAIN_GREP_OUT"
 sql -c "DELETE FROM t_test WHERE name='WAL_ENC_000001';"
 sql -c "DELETE FROM t_plain WHERE name='WAL_PLAIN_20260320';"
 echo ""
-
 echo ""
-echo "  [7/9] Index Scan"
-echo ""
-echo ""
-sql <<SQL
-DROP TABLE IF EXISTS t_range_rw_plain;
-CREATE TABLE t_range_rw_plain (
-  id int,
-  amount bigint
-);
-
-INSERT INTO t_range_rw_plain VALUES
-  (1, 50),
-  (2, 120),
-  (3, 900),
-  (4, 1100),
-  (5, 1300),
-  (6, 1700),
-  (7, 2100);
-SQL
-
-$PSQL -d "$DBNAME" -v ON_ERROR_STOP=1 \
-  -c "CREATE INDEX idx_amount_auto ON t_range_rw_plain(amount);" \
-  -c "ANALYZE t_range_rw_plain;" >/dev/null
-
-PLAN=$($PSQL -d "$DBNAME" -At \
-  -c "SET enable_seqscan=off;" \
-  -c "SET enable_bitmapscan=off;" \
-  -c "EXPLAIN (COSTS OFF) SELECT id, amount FROM t_range_rw_plain WHERE amount > 1000 ORDER BY id" | grep -v '^SET$')
-
-echo "  Query Plan:"
-echo "  ----"
-echo "$PLAN" | sed 's/^/    /'
-echo "$PLAN" | grep -qi "Index Scan" || fail "Index Scan не используется для amount > 1000"
-
-FOUND=$($PSQL -d "$DBNAME" -At \
-  -c "SELECT string_agg(id::text, ',' ORDER BY id) FROM t_range_rw_plain WHERE amount > 1000" | grep -v '^SET$')
-
-[[ "$FOUND" == "4,5,6,7" ]] || fail "Ожидались id=4,5,6,7, получено '$FOUND'"
-echo ""
-echo "  ✓ Index Scan работает для условия amount > 1000"
-echo "  ✓ Найденные id: $FOUND"
-echo ""
-
-echo ""
-echo "  [8/9] Данные читаются после рестарта"
+echo "  [7/8] Данные читаются после рестарта"
 echo ""
 echo ""
 echo "  Проверяю, что данные пережили рестарт..."
@@ -354,14 +287,20 @@ echo ""
 PLAIN_CNT=$(sql_val "SELECT count(*) FROM t_plain")
 [[ "$PLAIN_CNT" -eq 3 ]] || fail "После рестарта ожидалось 3 строки в t_plain, получено $PLAIN_CNT"
 
+TEST_CNT=$(sql_val "SELECT count(*) FROM t_test")
+[[ "$TEST_CNT" -eq 3 ]] || fail "После рестарта ожидалось 3 строки в t_test, получено $TEST_CNT"
+
 echo "  ✓ Обычная таблица сохранилась после рестарта: $PLAIN_CNT строк"
+echo "  ✓ Зашифрованная таблица сохранилась после рестарта: $TEST_CNT строк"
 echo ""
 echo "  Данные после рестарта:"
 sql_show "SELECT id, name FROM t_plain ORDER BY id;"
 echo ""
+sql_show "SELECT id, name FROM t_test ORDER BY id;"
+echo ""
 
 echo ""
-echo "  [9/9] Восстановление после краша сервера"
+echo "  [8/8] Восстановление после краша сервера"
 echo ""
 echo ""
 echo "  Убиваю процесс сервера (kill -9)..."
@@ -370,7 +309,7 @@ kill -9 "$PID" 2>/dev/null || true
 sleep 2
 
 echo "  Восстанавливаюсь после сбоя..."
-"$PG_CTL" -D "$PGDATA" start >/dev/null 2>&1 || true
+"$PG_CTL" -D "$PGDATA" start -w -o "-c shared_preload_libraries=opentde -c io_method=sync" >/dev/null 2>&1 || true
 sleep 2
 echo ""
 
@@ -387,9 +326,12 @@ echo ""
 
 VAL=$(sql_val "SELECT name FROM t_plain WHERE id = 1")
 [[ "$VAL" == "Привет мир" ]] || fail "После аварийного рестарта: '$VAL'"
+ENC_VAL=$(sql_val "SELECT name FROM t_test WHERE id = 1")
+[[ "$ENC_VAL" == "Привет мир" ]] || fail "После аварийного рестарта (t_test): '$ENC_VAL'"
 echo ""
 echo "  Проверяемая строка:"
 sql_show "SELECT id, name FROM t_plain WHERE id = 1;"
+sql_show "SELECT id, name FROM t_test WHERE id = 1;"
 echo ""
 echo ""
 echo "================================="

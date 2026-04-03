@@ -42,6 +42,8 @@ PG_FUNCTION_INFO_V1(opentde_blind_bucket_tokens_int8);
 
 static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
 static bool opentde_utility_hook_installed = false;
+Oid opentde_pending_index_parent_storage_oid = InvalidOid;
+Oid opentde_pending_index_child_storage_oid = InvalidOid;
 
 static bool
 opentde_has_key_for_storage_oid(Oid storage_oid)
@@ -96,6 +98,9 @@ opentde_enable_relation_storage_key(Oid relation_oid)
     Oid storage_oid;
 
     storage_oid = opentde_relation_storage_oid(relation_oid);
+    if (opentde_storage_key_exists(storage_oid))
+        return;
+
     (void) opentde_get_active_table_key_version(storage_oid);
 }
 
@@ -201,8 +206,7 @@ opentde_maybe_encrypt_indexes_for_table(Oid table_oid)
     {
         Oid index_oid = lfirst_oid(lc);
 
-        if (!opentde_is_relation_encrypted(index_oid))
-            opentde_enable_relation_storage_key(index_oid);
+        opentde_reencrypt_relation_storage(index_oid);
     }
 
     list_free(index_list);
@@ -220,6 +224,24 @@ opentde_ProcessUtility(PlannedStmt *pstmt,
                        QueryCompletion *qc)
 {
     Node *parsetree = pstmt->utilityStmt;
+    Oid   saved_pending_index_parent_storage_oid = opentde_pending_index_parent_storage_oid;
+    Oid   saved_pending_index_child_storage_oid = opentde_pending_index_child_storage_oid;
+
+    opentde_pending_index_parent_storage_oid = InvalidOid;
+    opentde_pending_index_child_storage_oid = InvalidOid;
+
+    if (IsA(parsetree, IndexStmt))
+    {
+        IndexStmt *stmt = (IndexStmt *) parsetree;
+        Oid        table_oid;
+
+        if (stmt->relation != NULL)
+        {
+            table_oid = RangeVarGetRelid(stmt->relation, NoLock, true);
+            if (OidIsValid(table_oid) && opentde_is_relation_encrypted(table_oid))
+                opentde_pending_index_parent_storage_oid = opentde_relation_storage_oid(table_oid);
+        }
+    }
 
     if (prev_ProcessUtility_hook)
         prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree,
@@ -229,7 +251,7 @@ opentde_ProcessUtility(PlannedStmt *pstmt,
                                 context, params, queryEnv, dest, qc);
 
     if (!master_key_set)
-        return;
+        goto done;
 
     if (IsA(parsetree, IndexStmt))
     {
@@ -246,7 +268,7 @@ opentde_ProcessUtility(PlannedStmt *pstmt,
         if (opentde_is_relation_encrypted(table_oid))
             opentde_maybe_encrypt_indexes_for_table(table_oid);
 
-        return;
+        goto done;
     }
 
     if (IsA(parsetree, ReindexStmt))
@@ -264,6 +286,10 @@ opentde_ProcessUtility(PlannedStmt *pstmt,
         if (opentde_is_relation_encrypted(table_oid))
             opentde_maybe_encrypt_indexes_for_table(table_oid);
     }
+
+done:
+    opentde_pending_index_parent_storage_oid = saved_pending_index_parent_storage_oid;
+    opentde_pending_index_child_storage_oid = saved_pending_index_child_storage_oid;
 }
 
 void
@@ -349,7 +375,6 @@ opentde_set_master_key(PG_FUNCTION_ARGS)
     uint8_t *new_key;
     int    key_len;
 
-    elog(WARNING, "[OpenTDE] opentde_set_master_key start");
     key_data = PG_GETARG_BYTEA_P(0);
     key_len  = VARSIZE_ANY_EXHDR(key_data);
     new_key  = (uint8_t *) VARDATA_ANY(key_data);
@@ -367,9 +392,7 @@ opentde_set_master_key(PG_FUNCTION_ARGS)
 
     memcpy(global_key_mgr->master_key, new_key, MASTER_KEY_SIZE);
     master_key_set = true;
-    elog(WARNING, "[OpenTDE] master key copied, installing hooks");
     opentde_install_md_hooks();
-    elog(WARNING, "[OpenTDE] hooks installed");
 
     /* Сохранение ключа и загрузка существующих DEK/IV */
     opentde_save_master_key_to_file();
