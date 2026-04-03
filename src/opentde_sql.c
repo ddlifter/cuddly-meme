@@ -149,8 +149,15 @@ opentde_enable_table_family_encryption(Oid table_oid)
     foreach(lc, index_list)
     {
         Oid index_oid = lfirst_oid(lc);
+        Oid index_storage_oid;
 
-        opentde_enable_relation_storage_key(index_oid);
+        index_storage_oid = opentde_relation_storage_oid(index_oid);
+        if (!opentde_storage_key_exists(index_storage_oid))
+        {
+            opentde_copy_active_storage_key(rel->rd_locator.relNumber,
+                                            index_storage_oid);
+            opentde_reencrypt_relation_storage(index_oid);
+        }
     }
 
     list_free(index_list);
@@ -198,15 +205,19 @@ opentde_maybe_encrypt_indexes_for_table(Oid table_oid)
     Relation rel;
     List    *index_list;
     ListCell *lc;
+    Oid      table_storage_oid;
 
     rel = table_open(table_oid, AccessShareLock);
+    table_storage_oid = rel->rd_locator.relNumber;
     index_list = RelationGetIndexList(rel);
 
     foreach(lc, index_list)
     {
         Oid index_oid = lfirst_oid(lc);
+        Oid index_storage_oid;
 
-        opentde_reencrypt_relation_storage(index_oid);
+        index_storage_oid = opentde_relation_storage_oid(index_oid);
+        opentde_copy_active_storage_key(table_storage_oid, index_storage_oid);
     }
 
     list_free(index_list);

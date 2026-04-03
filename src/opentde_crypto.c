@@ -80,6 +80,8 @@ opentde_find_table_key_index(Oid table_oid, uint32_t key_version)
     return -1;
 }
 
+static int opentde_find_active_table_key_index(Oid table_oid);
+
 bool
 opentde_storage_key_exists(Oid storage_oid)
 {
@@ -96,6 +98,59 @@ opentde_storage_key_exists(Oid storage_oid)
     }
 
     return false;
+}
+
+void
+opentde_copy_active_storage_key(Oid source_storage_oid, Oid target_storage_oid)
+{
+    int source_idx;
+    int target_idx;
+
+    if (!OidIsValid(source_storage_oid) ||
+        !OidIsValid(target_storage_oid) ||
+        source_storage_oid == target_storage_oid)
+        return;
+
+    opentde_ensure_keys_loaded();
+    if (!master_key_set || !global_key_mgr)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("master key not set")));
+    }
+
+    target_idx = opentde_find_active_table_key_index(target_storage_oid);
+    if (target_idx >= 0)
+        return;
+
+    source_idx = opentde_find_active_table_key_index(source_storage_oid);
+    if (source_idx < 0)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("active DEK not found for source storage %u",
+                        source_storage_oid)));
+    }
+
+    opentde_ensure_key_array_capacity();
+    target_idx = global_key_mgr->key_count;
+
+    global_key_mgr->keys[target_idx].table_oid = target_storage_oid;
+    global_key_mgr->keys[target_idx].key_version =
+        global_key_mgr->keys[source_idx].key_version;
+    global_key_mgr->keys[target_idx].is_active = true;
+
+    memcpy(global_key_mgr->keys[target_idx].dek,
+           global_key_mgr->keys[source_idx].dek,
+           DEK_SIZE);
+    memset(global_key_mgr->keys[target_idx].wrapped_dek, 0, WRAPPED_DEK_SIZE);
+
+    opentde_wrap_dek(global_key_mgr->master_key,
+                     global_key_mgr->keys[target_idx].dek,
+                     global_key_mgr->keys[target_idx].wrapped_dek);
+
+    global_key_mgr->key_count++;
+    opentde_save_key_file();
 }
 
 /* Возвращает прямой указатель на DEK указанной версии без лишних аллокаций. */

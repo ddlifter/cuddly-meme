@@ -107,6 +107,10 @@ INSERT INTO t_test VALUES (3, '$SENTINEL_TEXT');
 INSERT INTO t_plain VALUES (1, 'Привет мир');
 INSERT INTO t_plain VALUES (2, 'Тестовая строка');
 INSERT INTO t_plain VALUES (3, '$SENTINEL_TEXT');
+
+CREATE INDEX t_test_id_idx ON t_test(id);
+CREATE INDEX t_test_name_idx ON t_test(name);
+CREATE INDEX t_plain_name_idx ON t_plain(name);
 SQL
 
 CNT=$(sql_val "SELECT count(*) FROM t_test")
@@ -178,17 +182,23 @@ echo ""
 # echo ""
 
 echo ""
-echo "  [3/6] Сравнение файлов: обычная vs зашифрованная таблица"
+echo "  [3/6] Сравнение файлов: обычная vs зашифрованная таблица/индекс"
 echo ""
 echo ""
 sql -c "CHECKPOINT;"
 ENC_RELPATH=$(sql_val "SELECT pg_relation_filepath('t_test'::regclass)")
 PLAIN_RELPATH=$(sql_val "SELECT pg_relation_filepath('t_plain'::regclass)")
+ENC_IDX_RELPATH=$(sql_val "SELECT pg_relation_filepath('t_test_name_idx'::regclass)")
+PLAIN_IDX_RELPATH=$(sql_val "SELECT pg_relation_filepath('t_plain_name_idx'::regclass)")
 ENC_FILE="$PGDATA/$ENC_RELPATH"
 PLAIN_FILE="$PGDATA/$PLAIN_RELPATH"
+ENC_IDX_FILE="$PGDATA/$ENC_IDX_RELPATH"
+PLAIN_IDX_FILE="$PGDATA/$PLAIN_IDX_RELPATH"
 
 [[ -f "$PLAIN_FILE" ]] || fail "Файл обычной таблицы не найден: $PLAIN_FILE"
 [[ -f "$ENC_FILE" ]] || fail "Файл зашифрованной таблицы не найден: $ENC_FILE"
+[[ -f "$PLAIN_IDX_FILE" ]] || fail "Файл обычного индекса не найден: $PLAIN_IDX_FILE"
+[[ -f "$ENC_IDX_FILE" ]] || fail "Файл зашифрованного индекса не найден: $ENC_IDX_FILE"
 
 SENTINEL_HEX=$(to_hex "$SENTINEL_TEXT")
 echo "  Sentinel String:  $SENTINEL_TEXT"
@@ -197,8 +207,11 @@ echo ""
 echo "  Файлы таблиц:"
 echo "    Plain:     $PLAIN_FILE"
 echo "    Encrypted: $ENC_FILE"
+echo "  Файлы индексов:"
+echo "    Plain idx:     $PLAIN_IDX_FILE"
+echo "    Encrypted idx: $ENC_IDX_FILE"
 echo ""
-ls -lh "$PLAIN_FILE" "$ENC_FILE" | sed 's/^/    /'
+ls -lh "$PLAIN_FILE" "$ENC_FILE" "$PLAIN_IDX_FILE" "$ENC_IDX_FILE" | sed 's/^/    /'
 echo ""
 echo "  Содержимое файла PLAIN (hexdump):"
 echo "  ----"
@@ -219,6 +232,17 @@ if hexdump -v -e '/1 "%02x"' "$ENC_FILE" | grep -q -i "$SENTINEL_HEX"; then
   fail "hex-паттерн найден в зашифрованной таблице $ENC_RELPATH"
 fi
 echo "  ✓ ENCRYPTED: hex-паттерн отсутствует"
+
+PLAIN_IDX_HEX=$(hexdump -v -e '/1 "%02x"' "$PLAIN_IDX_FILE")
+if ! printf '%s' "$PLAIN_IDX_HEX" | grep -q -i "$SENTINEL_HEX"; then
+  fail "hex-паттерн не найден в обычном индексе $PLAIN_IDX_RELPATH"
+fi
+echo "  ✓ PLAIN INDEX: hex-паттерн найден"
+
+if hexdump -v -e '/1 "%02x"' "$ENC_IDX_FILE" | grep -q -i "$SENTINEL_HEX"; then
+  fail "hex-паттерн найден в зашифрованном индексе $ENC_IDX_RELPATH"
+fi
+echo "  ✓ ENCRYPTED INDEX: hex-паттерн отсутствует"
 echo ""
 echo ""
 echo "  [4/6] Проверка WAL"
@@ -279,6 +303,29 @@ echo "  Данные после рестарта:"
 sql_show "SELECT id, name FROM t_plain ORDER BY id;"
 echo ""
 sql_show "SELECT id, name FROM t_test ORDER BY id;"
+echo ""
+
+echo "  Проверка Index Scan по range (id > / id <) после рестарта:"
+PLAN=$($PSQL -d "$DBNAME" -At \
+  -c "SET enable_seqscan=off;" \
+  -c "SET enable_bitmapscan=off;" \
+  -c "EXPLAIN (COSTS OFF) SELECT id, name FROM t_test WHERE id > 1 ORDER BY id" | grep -v '^SET$')
+echo "$PLAN" | sed 's/^/    /'
+echo "$PLAN" | grep -qi "Index Scan" || fail "После рестарта для t_test(id > 1) не используется Index Scan"
+
+RANGE_GT=$(sql_val "SELECT string_agg(id::text, ',' ORDER BY id) FROM t_test WHERE id > 1")
+[[ "$RANGE_GT" == "2,3" ]] || fail "Range-поиск (id > 1) вернул '$RANGE_GT'"
+
+PLAN_LT=$($PSQL -d "$DBNAME" -At \
+  -c "SET enable_seqscan=off;" \
+  -c "SET enable_bitmapscan=off;" \
+  -c "EXPLAIN (COSTS OFF) SELECT id, name FROM t_test WHERE id < 3 ORDER BY id" | grep -v '^SET$')
+echo "$PLAN_LT" | sed 's/^/    /'
+echo "$PLAN_LT" | grep -qi "Index Scan" || fail "После рестарта для t_test(id < 3) не используется Index Scan"
+
+RANGE_LT=$(sql_val "SELECT string_agg(id::text, ',' ORDER BY id) FROM t_test WHERE id < 3")
+[[ "$RANGE_LT" == "1,2" ]] || fail "Range-поиск (id < 3) вернул '$RANGE_LT'"
+echo "  ✓ Range Index Scan работает после рестарта"
 echo ""
 
 echo ""
