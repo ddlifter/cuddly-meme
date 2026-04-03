@@ -77,7 +77,7 @@ restart
 
 # ===========================================================================
 echo ""
-echo "  [1/9] Установка расширения и создание таблиц"
+echo "  [1/6] Установка расширения и создание таблиц"
 echo ""
 echo ""
 sql <<SQL
@@ -122,46 +122,28 @@ echo "  Данные в t_test (зашифрованная таблица):"
 sql_show "SELECT id, name FROM t_test ORDER BY id;"
 echo ""
 
-# echo ""
-# echo "  [2/9] UPDATE — Обновляем колонку"
-# echo ""
-# echo ""
-# sql -c "UPDATE t_test SET name = 'Обновлённая' WHERE id = 2;"
+echo ""
+echo "  [2/6] UPDATE — Обновляем колонку"
+echo ""
+echo ""
+sql -c "UPDATE t_test SET name = 'Обновлённая' WHERE id = 2;"
 
-# UPD_NAME=$(sql_val "SELECT name FROM t_test WHERE id = 2")
-# [[ "$UPD_NAME" == "Обновлённая" ]] || fail "UPDATE name: '$UPD_NAME'"
+UPD_NAME=$(sql_val "SELECT name FROM t_test WHERE id = 2")
+[[ "$UPD_NAME" == "Обновлённая" ]] || fail "UPDATE name: '$UPD_NAME'"
 
-# UPD_ID=$(sql_val "SELECT id FROM t_test WHERE id = 2")
-# [[ "$UPD_ID" == "2" ]] || fail "UPDATE: id изменился на '$UPD_ID'"
+UPD_ID=$(sql_val "SELECT id FROM t_test WHERE id = 2")
+[[ "$UPD_ID" == "2" ]] || fail "UPDATE: id изменился на '$UPD_ID'"
 
-# sql -c "UPDATE t_test SET id = 20, name = 'Двойное обновление' WHERE id = 3;"
-# UPD2=$(sql_val "SELECT id || '|' || name FROM t_test WHERE id = 20")
-# [[ "$UPD2" == "20|Двойное обновление" ]] || fail "UPDATE обоих столбцов: '$UPD2'"
+sql -c "UPDATE t_test SET id = 20, name = 'Двойное обновление' WHERE id = 3;"
+UPD2=$(sql_val "SELECT id || '|' || name FROM t_test WHERE id = 20")
+[[ "$UPD2" == "20|Двойное обновление" ]] || fail "UPDATE обоих столбцов: '$UPD2'"
 
-# sql -c "UPDATE t_test SET id = 3, name = '$SENTINEL_TEXT' WHERE id = 20;"
-# echo "  ✓ UPDATE успешен"
-# echo ""
-# echo "  Данные после UPDATE:"
-# sql_show "SELECT id, name FROM t_test ORDER BY id;"
-# echo ""
-
-# echo ""
-# echo "  [3/9] COPY (массовая вставка)"
-# echo ""
-# echo ""
-# printf '4\tСтрока из COPY\n5\tЕщё одна строка\n' \
-#   | sql -c "COPY t_test (id, name) FROM STDIN;"
-
-# CNT=$(sql_val "SELECT count(*) FROM t_test")
-# [[ "$CNT" -eq 5 ]] || fail "После COPY ожидалось 5 строк, получено $CNT"
-
-# VAL=$(sql_val "SELECT name FROM t_test WHERE id = 4")
-# [[ "$VAL" == "Строка из COPY" ]] || fail "COPY: строка id=4 = '$VAL'"
-# echo "  ✓ COPY успешен: всего $CNT строк в таблице"
-# echo ""
-# echo "  Данные после COPY:"
-# sql_show "SELECT id, name FROM t_test ORDER BY id;"
-# echo ""
+sql -c "UPDATE t_test SET id = 3, name = '$SENTINEL_TEXT' WHERE id = 20;"
+echo "  ✓ UPDATE успешен"
+echo ""
+echo "  Данные после UPDATE:"
+sql_show "SELECT id, name FROM t_test ORDER BY id;"
+echo ""
 
 # echo ""
 # echo "  [4/9] Ротация DEK и чтение смешанных данных"
@@ -196,7 +178,7 @@ echo ""
 # echo ""
 
 echo ""
-echo "  [5/9] Сравнение файлов: обычная vs зашифрованная таблица"
+echo "  [3/6] Сравнение файлов: обычная vs зашифрованная таблица"
 echo ""
 echo ""
 sql -c "CHECKPOINT;"
@@ -239,7 +221,7 @@ fi
 echo "  ✓ ENCRYPTED: hex-паттерн отсутствует"
 echo ""
 echo ""
-echo "  [6/8] Проверка WAL"
+echo "  [4/6] Проверка WAL"
 echo ""
 echo ""
 sql -c "DELETE FROM t_test WHERE name='WAL_ENC_000001';"
@@ -275,7 +257,7 @@ sql -c "DELETE FROM t_test WHERE name='WAL_ENC_000001';"
 sql -c "DELETE FROM t_plain WHERE name='WAL_PLAIN_20260320';"
 echo ""
 echo ""
-echo "  [7/8] Данные читаются после рестарта"
+echo "  [5/6] Данные читаются после рестарта"
 echo ""
 echo ""
 echo "  Проверяю, что данные пережили рестарт..."
@@ -300,7 +282,7 @@ sql_show "SELECT id, name FROM t_test ORDER BY id;"
 echo ""
 
 echo ""
-echo "  [8/8] Восстановление после краша сервера"
+echo "  [6/6] Восстановление после краша сервера"
 echo ""
 echo ""
 echo "  Убиваю процесс сервера (kill -9)..."
