@@ -16,7 +16,7 @@ void kuz_set_key(kuz_key_t *ctx, const uint8_t *key);
 
 // Шифрование одного блока (16 байт)
 // out = Encrypt(in)
-void kuz_encrypt_block(kuz_key_t *ctx, const uint8_t *in, uint8_t *out);
+void kuz_encrypt_block(const kuz_key_t *ctx, const uint8_t *in, uint8_t *out);
 
 void kuz_ctr_crypt_ctx(const kuz_key_t *ctx, const uint8_t *iv, uint8_t *data, size_t len);
 

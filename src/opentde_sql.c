@@ -18,6 +18,7 @@ opentde_page_crypto_selftest(PG_FUNCTION_ARGS)
 #include "catalog/pg_class.h"
 #include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
+#include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
 #include "tcop/utility.h"
 #include "utils/array.h"
@@ -44,6 +45,93 @@ static ProcessUtility_hook_type prev_ProcessUtility_hook = NULL;
 static bool opentde_utility_hook_installed = false;
 Oid opentde_pending_index_parent_storage_oid = InvalidOid;
 Oid opentde_pending_index_child_storage_oid = InvalidOid;
+
+static Oid opentde_relation_storage_oid_locked(Oid relation_oid, LOCKMODE lockmode);
+
+static List *
+opentde_lappend_oid_unique(List *oids, Oid value)
+{
+    ListCell *lc;
+
+    if (!OidIsValid(value))
+        return oids;
+
+    foreach(lc, oids)
+    {
+        if (lfirst_oid(lc) == value)
+            return oids;
+    }
+
+    return lappend_oid(oids, value);
+}
+
+static List *
+opentde_collect_drop_storage_oids(DropStmt *stmt)
+{
+    List     *storage_oids = NIL;
+    ListCell *lc;
+
+    if (stmt->removeType != OBJECT_TABLE &&
+        stmt->removeType != OBJECT_INDEX &&
+        stmt->removeType != OBJECT_MATVIEW)
+        return NIL;
+
+    foreach(lc, stmt->objects)
+    {
+        List     *objname;
+        RangeVar *rv;
+        Oid       relid;
+
+        if (!IsA(lfirst(lc), List))
+            continue;
+
+        objname = (List *) lfirst(lc);
+        rv = makeRangeVarFromNameList(objname);
+        relid = RangeVarGetRelid(rv, AccessShareLock, true);
+        if (!OidIsValid(relid))
+            continue;
+
+        if (stmt->removeType == OBJECT_INDEX)
+        {
+            storage_oids = opentde_lappend_oid_unique(
+                storage_oids,
+                opentde_relation_storage_oid_locked(relid, AccessShareLock));
+            continue;
+        }
+
+        {
+            Relation  rel;
+            List     *index_list;
+            ListCell *ilc;
+
+            rel = table_open(relid, AccessShareLock);
+
+            storage_oids = opentde_lappend_oid_unique(storage_oids,
+                                                      rel->rd_locator.relNumber);
+
+            if (OidIsValid(rel->rd_rel->reltoastrelid))
+                storage_oids = opentde_lappend_oid_unique(
+                    storage_oids,
+                    opentde_relation_storage_oid_locked(rel->rd_rel->reltoastrelid,
+                                                        AccessShareLock));
+
+            index_list = RelationGetIndexList(rel);
+            foreach(ilc, index_list)
+            {
+                Oid index_oid = lfirst_oid(ilc);
+
+                storage_oids = opentde_lappend_oid_unique(
+                    storage_oids,
+                    opentde_relation_storage_oid_locked(index_oid, AccessShareLock));
+            }
+
+            list_free(index_list);
+            table_close(rel, AccessShareLock);
+        }
+    }
+
+    return storage_oids;
+}
 
 static bool
 opentde_has_key_for_storage_oid(Oid storage_oid)
@@ -217,7 +305,11 @@ opentde_maybe_encrypt_indexes_for_table(Oid table_oid)
         Oid index_storage_oid;
 
         index_storage_oid = opentde_relation_storage_oid(index_oid);
-        opentde_copy_active_storage_key(table_storage_oid, index_storage_oid);
+        if (!opentde_storage_key_exists(index_storage_oid))
+        {
+            opentde_copy_active_storage_key(table_storage_oid, index_storage_oid);
+            opentde_reencrypt_relation_storage(index_oid);
+        }
     }
 
     list_free(index_list);
@@ -237,6 +329,8 @@ opentde_ProcessUtility(PlannedStmt *pstmt,
     Node *parsetree = pstmt->utilityStmt;
     Oid   saved_pending_index_parent_storage_oid = opentde_pending_index_parent_storage_oid;
     Oid   saved_pending_index_child_storage_oid = opentde_pending_index_child_storage_oid;
+    List *drop_storage_oids = NIL;
+    ListCell *lc;
 
     opentde_pending_index_parent_storage_oid = InvalidOid;
     opentde_pending_index_child_storage_oid = InvalidOid;
@@ -254,6 +348,9 @@ opentde_ProcessUtility(PlannedStmt *pstmt,
         }
     }
 
+    if (IsA(parsetree, DropStmt))
+        drop_storage_oids = opentde_collect_drop_storage_oids((DropStmt *) parsetree);
+
     if (prev_ProcessUtility_hook)
         prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree,
                                  context, params, queryEnv, dest, qc);
@@ -264,17 +361,25 @@ opentde_ProcessUtility(PlannedStmt *pstmt,
     if (!master_key_set)
         goto done;
 
+    if (drop_storage_oids != NIL)
+    {
+        foreach(lc, drop_storage_oids)
+            opentde_forget_table_keys(lfirst_oid(lc));
+
+        goto done;
+    }
+
     if (IsA(parsetree, IndexStmt))
     {
         IndexStmt *stmt = (IndexStmt *) parsetree;
         Oid        table_oid;
 
         if (stmt->relation == NULL)
-            return;
+            goto done;
 
         table_oid = RangeVarGetRelid(stmt->relation, NoLock, true);
         if (!OidIsValid(table_oid))
-            return;
+            goto done;
 
         if (opentde_is_relation_encrypted(table_oid))
             opentde_maybe_encrypt_indexes_for_table(table_oid);
@@ -288,17 +393,20 @@ opentde_ProcessUtility(PlannedStmt *pstmt,
         Oid          table_oid;
 
         if (stmt->kind != REINDEX_OBJECT_TABLE || stmt->relation == NULL)
-            return;
+            goto done;
 
         table_oid = RangeVarGetRelid(stmt->relation, NoLock, true);
         if (!OidIsValid(table_oid))
-            return;
+            goto done;
 
         if (opentde_is_relation_encrypted(table_oid))
             opentde_maybe_encrypt_indexes_for_table(table_oid);
     }
 
 done:
+    if (drop_storage_oids != NIL)
+        list_free(drop_storage_oids);
+
     opentde_pending_index_parent_storage_oid = saved_pending_index_parent_storage_oid;
     opentde_pending_index_child_storage_oid = saved_pending_index_child_storage_oid;
 }

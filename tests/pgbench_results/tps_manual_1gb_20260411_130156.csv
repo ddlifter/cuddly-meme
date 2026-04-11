@@ -1,0 +1,4 @@
+workload,clients,jobs,duration_s,tps_plain,tps_enc,overhead_pct,status
+read_point,4,4,30,NA,NA,NA,cluster_restart_before_enc_failed
+read_point,16,16,30,26117.824801,306.644502,98,83,ok
+read_point,32,16,30,NA,NA,NA,cluster_start_failed

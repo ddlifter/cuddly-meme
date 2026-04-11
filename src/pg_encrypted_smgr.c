@@ -4,11 +4,13 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/aio.h"
+#include "storage/backendid.h"
 #include "access/table.h"
 #include "storage/bufpage.h"
 #include "storage/smgr.h"
 #include "storage/md.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
 
 PG_MODULE_MAGIC;
 
@@ -69,15 +71,6 @@ get_storage_key(Oid storage_oid, uint8_t *key_out)
     return false;
 }
 
-static bool
-get_table_key(SMgrRelation reln, uint8_t *key_out)
-{
-    Oid table_oid;
-
-    table_oid = relation_key_owner_oid(reln);
-    return get_storage_key(table_oid, key_out);
-}
-
 static void
 make_iv(Oid relfilenode, ForkNumber forknum, BlockNumber blocknum, uint8_t *iv)
 {
@@ -88,12 +81,11 @@ make_iv(Oid relfilenode, ForkNumber forknum, BlockNumber blocknum, uint8_t *iv)
 }
 
 static void
-crypt_page_body(void *page_ptr, Oid relfilenode, uint8_t *key, ForkNumber forknum, BlockNumber blocknum)
+crypt_page_body_ctx(void *page_ptr, Oid relfilenode, const kuz_key_t *ctx, ForkNumber forknum, BlockNumber blocknum)
 {
     PageHeader page_header;
     uint16     body_offset;
     uint8_t    iv[DATA_IV_SIZE];
-    kuz_key_t  ctx;
 
     page_header = (PageHeader) page_ptr;
     body_offset = page_header->pd_upper;
@@ -101,8 +93,36 @@ crypt_page_body(void *page_ptr, Oid relfilenode, uint8_t *key, ForkNumber forknu
         return;
 
     make_iv(relfilenode, forknum, blocknum, iv);
-    kuz_set_key(&ctx, key);
-    kuz_ctr_crypt_ctx(&ctx, iv, (uint8_t *) page_ptr + body_offset, BLCKSZ - body_offset);
+    kuz_ctr_crypt_ctx(ctx, iv, (uint8_t *) page_ptr + body_offset, BLCKSZ - body_offset);
+}
+
+static bool
+get_cached_table_crypto(SMgrRelation reln, uint8_t *key_out, const kuz_key_t **ctx_out)
+{
+    static bool      cache_valid = false;
+    static Oid       cached_storage_oid = InvalidOid;
+    static uint8_t   cached_raw_key[DEK_SIZE];
+    static kuz_key_t cached_ctx;
+    Oid              storage_oid;
+
+    storage_oid = relation_key_owner_oid(reln);
+    if (!get_storage_key(storage_oid, key_out))
+        return false;
+
+    if (cache_valid &&
+        cached_storage_oid == storage_oid &&
+        memcmp(cached_raw_key, key_out, DEK_SIZE) == 0)
+    {
+        *ctx_out = &cached_ctx;
+        return true;
+    }
+
+    kuz_set_key(&cached_ctx, key_out);
+    memcpy(cached_raw_key, key_out, DEK_SIZE);
+    cached_storage_oid = storage_oid;
+    cache_valid = true;
+    *ctx_out = &cached_ctx;
+    return true;
 }
 
 static void
@@ -117,10 +137,11 @@ encrypted_smgr_startreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknu
     io_method = GetConfigOption("io_method", true, false);
     if (io_method != NULL && strcmp(io_method, "sync") == 0)
     {
-        Oid storage_oid = relation_key_owner_oid(reln);
+        Oid relfilenode_oid = reln->smgr_rlocator.locator.relNumber;
         uint8_t key[DEK_SIZE];
+        const kuz_key_t *kuz_ctx;
 
-        if (!get_storage_key(storage_oid, key))
+        if (!get_cached_table_crypto(reln, key, &kuz_ctx))
             return;
 
         for (BlockNumber i = 0; i < nblocks; i++)
@@ -128,7 +149,7 @@ encrypted_smgr_startreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknu
             if (buffers[i] == NULL)
                 continue;
 
-            crypt_page_body(buffers[i], storage_oid, key, forknum, blocknum + i);
+            crypt_page_body_ctx(buffers[i], relfilenode_oid, kuz_ctx, forknum, blocknum + i);
         }
     }
 }
@@ -139,14 +160,20 @@ encrypted_smgr_readv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum
 {
     original_md_smgr.smgr_readv(reln, forknum, blocknum, buffers, nblocks, chain_index + 1);
 
-    for (BlockNumber i = 0; i < nblocks; i++)
     {
         uint8_t key[DEK_SIZE];
+        const kuz_key_t *kuz_ctx;
+        Oid relfilenode_oid;
 
-        if (!get_table_key(reln, key))
-            continue;
+        if (!get_cached_table_crypto(reln, key, &kuz_ctx))
+            return;
 
-        crypt_page_body(buffers[i], reln->smgr_rlocator.locator.relNumber, key, forknum, blocknum + i);
+        relfilenode_oid = reln->smgr_rlocator.locator.relNumber;
+
+        for (BlockNumber i = 0; i < nblocks; i++)
+        {
+            crypt_page_body_ctx(buffers[i], relfilenode_oid, kuz_ctx, forknum, blocknum + i);
+        }
     }
 }
 
@@ -157,25 +184,27 @@ encrypted_smgr_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknu
 {
     void **enc_bufs;
     void **enc_raw_bufs;
+    uint8_t key[DEK_SIZE];
+    const kuz_key_t *kuz_ctx;
 
     enc_bufs = (void **) palloc(sizeof(void *) * nblocks);
     enc_raw_bufs = (void **) palloc(sizeof(void *) * nblocks);
 
+    if (!get_cached_table_crypto(reln, key, &kuz_ctx))
+    {
+        original_md_smgr.smgr_writev(reln, forknum, blocknum, buffers,
+                                     nblocks, skipFsync, chain_index + 1);
+        pfree(enc_raw_bufs);
+        pfree(enc_bufs);
+        return;
+    }
+
     for (BlockNumber i = 0; i < nblocks; i++)
     {
-        uint8_t key[DEK_SIZE];
-
-        if (!get_table_key(reln, key))
-        {
-            enc_bufs[i] = (void *) buffers[i];
-            enc_raw_bufs[i] = NULL;
-            continue;
-        }
-
         enc_raw_bufs[i] = palloc(BLCKSZ + PG_IO_ALIGN_SIZE);
         enc_bufs[i] = (void *) TYPEALIGN(PG_IO_ALIGN_SIZE, enc_raw_bufs[i]);
         memcpy(enc_bufs[i], buffers[i], BLCKSZ);
-        crypt_page_body(enc_bufs[i], reln->smgr_rlocator.locator.relNumber, key, forknum, blocknum + i);
+        crypt_page_body_ctx(enc_bufs[i], reln->smgr_rlocator.locator.relNumber, kuz_ctx, forknum, blocknum + i);
         PageSetChecksumInplace((Page) enc_bufs[i], blocknum + i);
     }
 
@@ -197,8 +226,9 @@ encrypted_smgr_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknu
                       const void *buffer, bool skipFsync, SmgrChainIndex chain_index)
 {
     uint8_t key[DEK_SIZE];
+    const kuz_key_t *kuz_ctx;
 
-    if (!get_table_key(reln, key))
+    if (!get_cached_table_crypto(reln, key, &kuz_ctx))
     {
         original_md_smgr.smgr_extend(reln, forknum, blocknum, buffer, skipFsync, chain_index + 1);
         return;
@@ -212,7 +242,7 @@ encrypted_smgr_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknu
         enc_buf = (uint8_t *) TYPEALIGN(PG_IO_ALIGN_SIZE, enc_raw_buf);
 
         memcpy(enc_buf, buffer, BLCKSZ);
-        crypt_page_body(enc_buf, reln->smgr_rlocator.locator.relNumber, key, forknum, blocknum);
+        crypt_page_body_ctx(enc_buf, reln->smgr_rlocator.locator.relNumber, kuz_ctx, forknum, blocknum);
         PageSetChecksumInplace((Page) enc_buf, blocknum);
         original_md_smgr.smgr_extend(reln, forknum, blocknum, enc_buf, skipFsync, chain_index + 1);
         pfree(enc_raw_buf);
@@ -276,9 +306,18 @@ encrypted_smgr_create(RelFileLocator relold, SMgrRelation reln, ForkNumber forkn
                       bool isRedo, SmgrChainIndex chain_index)
 {
     if (opentde_pending_index_parent_storage_oid != InvalidOid &&
-        opentde_pending_index_child_storage_oid == InvalidOid)
+        opentde_pending_index_child_storage_oid == InvalidOid &&
+        forknum == MAIN_FORKNUM &&
+        !isRedo &&
+        reln->smgr_rlocator.backend == InvalidBackendId)
     {
         opentde_pending_index_child_storage_oid = reln->smgr_rlocator.locator.relNumber;
+
+        if (opentde_storage_key_exists(opentde_pending_index_child_storage_oid))
+            opentde_forget_table_keys(opentde_pending_index_child_storage_oid);
+
+        opentde_copy_active_storage_key(opentde_pending_index_parent_storage_oid,
+                                        opentde_pending_index_child_storage_oid);
     }
 
     original_md_smgr.smgr_create(relold, reln, forknum, isRedo, chain_index + 1);
@@ -310,6 +349,7 @@ encrypted_smgr_fd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, u
 void
 opentde_reencrypt_relation_storage(Oid relation_oid)
 {
+    char relkind;
     Relation rel;
     SMgrRelation smgr;
     ForkNumber forknum = MAIN_FORKNUM;
@@ -318,7 +358,11 @@ opentde_reencrypt_relation_storage(Oid relation_oid)
     char   *raw_buffer;
     void   *buffers[1];
 
-    rel = table_open(relation_oid, AccessExclusiveLock);
+    relkind = get_rel_relkind(relation_oid);
+    if (relkind == RELKIND_INDEX)
+        rel = index_open(relation_oid, AccessExclusiveLock);
+    else
+        rel = table_open(relation_oid, AccessExclusiveLock);
 
     smgr = smgropen(rel->rd_locator, rel->rd_backend);
     nblocks = original_md_smgr.smgr_nblocks(smgr, forknum, 0);
@@ -335,7 +379,10 @@ opentde_reencrypt_relation_storage(Oid relation_oid)
     }
 
     smgrclose(smgr);
-    table_close(rel, AccessExclusiveLock);
+    if (relkind == RELKIND_INDEX)
+        index_close(rel, AccessExclusiveLock);
+    else
+        table_close(rel, AccessExclusiveLock);
 }
 
 static const f_smgr encrypted_smgr = {

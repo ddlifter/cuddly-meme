@@ -1,0 +1,13 @@
+target_gb,rows,plain_gb,enc_gb,workload,clients,jobs,duration_s,tps_plain,tps_enc,enc_overhead_pct
+1,374973,1,00,1,00,read_point,4,4,30,7071.674605,452.145848,93,61
+1,374973,1,00,1,00,read_point,16,16,30,10935.416614,378.395150,96,54
+1,374973,1,00,1,00,read_point,32,16,30,NA,NA,NA
+1,374973,1,00,1,00,read_range,4,4,30,NA,NA,NA
+1,374973,1,00,1,00,read_range,16,16,30,NA,NA,NA
+1,374973,1,00,1,00,read_range,32,16,30,NA,NA,NA
+1,374973,1,00,1,00,write_update,4,4,30,NA,NA,NA
+1,374973,1,00,1,00,write_update,16,16,30,NA,NA,NA
+1,374973,1,00,1,00,write_update,32,16,30,NA,NA,NA
+1,374973,1,00,1,00,mixed_rw,4,4,30,NA,NA,NA
+1,374973,1,00,1,00,mixed_rw,16,16,30,NA,NA,NA
+1,374973,1,00,1,00,mixed_rw,32,16,30,NA,NA,NA

@@ -30,7 +30,6 @@ bool master_key_set = false; // Define the global master key set flag (was only 
 
 static time_t key_file_last_mtime = 0;
 static off_t key_file_last_size = 0;
-static int master_key_load_skip_calls = 0;
 static bool master_key_load_failed_logged = false;
 
 static void
@@ -49,16 +48,9 @@ void opentde_ensure_keys_loaded(void)
     if (master_key_set)
         return;
 
-    if (master_key_load_skip_calls > 0)
-    {
-        master_key_load_skip_calls--;
-        return;
-    }
-
     if (opentde_load_master_key_from_file())
     {
         master_key_set = true;
-        master_key_load_skip_calls = 0;
         master_key_load_failed_logged = false;
 
         if (!global_key_mgr)
@@ -70,12 +62,9 @@ void opentde_ensure_keys_loaded(void)
         if (!master_key_load_failed_logged)
         {
             elog(LOG,
-                 "[OpenTDE] master key is unavailable from Vault; suppressing repeated retries for this backend");
+                 "[OpenTDE] master key is unavailable from Vault; backend will keep retrying load");
             master_key_load_failed_logged = true;
         }
-
-        /* Avoid hammering Vault and log spam on every tuple/page access. */
-        master_key_load_skip_calls = 256;
     }
 }
 #include "port.h"

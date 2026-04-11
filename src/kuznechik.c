@@ -1,21 +1,19 @@
 
+#include "kuznechik.h"
+
 #include <stdint.h>
 #include <tmmintrin.h> // SSSE3 for PSHUFB
 
 // SIMD S-box (16 bytes at a time, SSSE3)
-static void kuz_s_simd(uint8_t *out, const uint8_t *in, const uint8_t *sbox) {
 #if defined(__SSSE3__)
-    __m128i input = _mm_loadu_si128((const __m128i*)in);
+static void kuz_s_simd(uint8_t *out, const uint8_t *in, const uint8_t *sbox) {
     // S-box must be 16x16 table for PSHUFB, so we use 16 S-box vectors
     // For simplicity, process 16 bytes using 16 S-box vectors
     uint8_t temp[16];
     for (int i = 0; i < 16; i++) temp[i] = sbox[in[i]];
     _mm_storeu_si128((__m128i*)out, _mm_loadu_si128((const __m128i*)temp));
-#else
-    // Fallback: scalar
-    for (int i = 0; i < 16; i++) out[i] = sbox[in[i]];
-#endif
 }
+#endif
 #include <immintrin.h>
 #include <stdint.h>
 #include <string.h>
@@ -54,8 +52,6 @@ static const uint8_t C[10][16] = {
     {0x9D,0xB4,0xF8,0x50,0x62,0x5B,0x7C,0x9D,0xA6,0x28,0x50,0xF0,0x8C,0xD9,0xB4,0x09},
     {0xD6,0xF0,0x5C,0xB8,0xDA,0x99,0x63,0x9B,0x3D,0xA2,0xC8,0x10,0xE0,0x32,0x6D,0x0A}
 };
-
-typedef uint8_t kuz_key_t[10][16];  // 10 раундовых ключей по 16 байт
 
 // Галуа умножение в поле GF(2^8)
 static uint8_t galois_mul(uint8_t a, uint8_t b) {
@@ -169,98 +165,70 @@ static inline void LSX(const uint8_t *key, uint8_t *state) {
 
 // Генерация раундовых ключей
 void kuz_set_key(kuz_key_t *ctx, const uint8_t *key) {
-    memcpy((*ctx)[0], key, 16);      // K0
-    memcpy((*ctx)[1], key + 16, 16); // K1
+    memcpy(ctx->keys[0], key, 16);      // K0
+    memcpy(ctx->keys[1], key + 16, 16); // K1
     
     uint8_t temp[16];
     for(int i = 2; i < 10; i++) {
         // F(Ci-2) = LSX(Ci-2, Ki-2)
-        memcpy(temp, (*ctx)[i-2], 16);
+        memcpy(temp, ctx->keys[i-2], 16);
         LSX(C[i-2], temp);
         
         // Ki = F(Ci-2) ^ Ki-1
         for(int j = 0; j < 16; j++) {
-            (*ctx)[i][j] = temp[j] ^ (*ctx)[i-1][j];
+            ctx->keys[i][j] = temp[j] ^ ctx->keys[i-1][j];
         }
     }
 }
 
 // Шифрование одного блока
-void kuz_encrypt_block(kuz_key_t *ctx, const uint8_t *in, uint8_t *out) {
+void kuz_encrypt_block(const kuz_key_t *ctx, const uint8_t *in, uint8_t *out) {
     uint8_t state[16];
     memcpy(state, in, 16);
 
     // 9 раундов LSX (unrolled call)
-    LSX((*ctx)[0], state);
-    LSX((*ctx)[1], state);
-    LSX((*ctx)[2], state);
-    LSX((*ctx)[3], state);
-    LSX((*ctx)[4], state);
-    LSX((*ctx)[5], state);
-    LSX((*ctx)[6], state);
-    LSX((*ctx)[7], state);
-    LSX((*ctx)[8], state);
+    LSX(ctx->keys[0], state);
+    LSX(ctx->keys[1], state);
+    LSX(ctx->keys[2], state);
+    LSX(ctx->keys[3], state);
+    LSX(ctx->keys[4], state);
+    LSX(ctx->keys[5], state);
+    LSX(ctx->keys[6], state);
+    LSX(ctx->keys[7], state);
+    LSX(ctx->keys[8], state);
 
     // Финальный раунд: только XOR с K9 (unrolled)
-    out[0] = state[0] ^ (*ctx)[9][0];
-    out[1] = state[1] ^ (*ctx)[9][1];
-    out[2] = state[2] ^ (*ctx)[9][2];
-    out[3] = state[3] ^ (*ctx)[9][3];
-    out[4] = state[4] ^ (*ctx)[9][4];
-    out[5] = state[5] ^ (*ctx)[9][5];
-    out[6] = state[6] ^ (*ctx)[9][6];
-    out[7] = state[7] ^ (*ctx)[9][7];
-    out[8] = state[8] ^ (*ctx)[9][8];
-    out[9] = state[9] ^ (*ctx)[9][9];
-    out[10] = state[10] ^ (*ctx)[9][10];
-    out[11] = state[11] ^ (*ctx)[9][11];
-    out[12] = state[12] ^ (*ctx)[9][12];
-    out[13] = state[13] ^ (*ctx)[9][13];
-    out[14] = state[14] ^ (*ctx)[9][14];
-    out[15] = state[15] ^ (*ctx)[9][15];
+    out[0] = state[0] ^ ctx->keys[9][0];
+    out[1] = state[1] ^ ctx->keys[9][1];
+    out[2] = state[2] ^ ctx->keys[9][2];
+    out[3] = state[3] ^ ctx->keys[9][3];
+    out[4] = state[4] ^ ctx->keys[9][4];
+    out[5] = state[5] ^ ctx->keys[9][5];
+    out[6] = state[6] ^ ctx->keys[9][6];
+    out[7] = state[7] ^ ctx->keys[9][7];
+    out[8] = state[8] ^ ctx->keys[9][8];
+    out[9] = state[9] ^ ctx->keys[9][9];
+    out[10] = state[10] ^ ctx->keys[9][10];
+    out[11] = state[11] ^ ctx->keys[9][11];
+    out[12] = state[12] ^ ctx->keys[9][12];
+    out[13] = state[13] ^ ctx->keys[9][13];
+    out[14] = state[14] ^ ctx->keys[9][14];
+    out[15] = state[15] ^ ctx->keys[9][15];
 }
 
-static inline void xor16_simd(uint8_t *dst, const uint8_t *src, size_t n) {
-#if defined(__AVX2__)
-    size_t i = 0;
-    for (; i + 32 <= n; i += 32) {
-        __m256i a = _mm256_loadu_si256((__m256i*)(dst + i));
-        __m256i b = _mm256_loadu_si256((__m256i*)(src + (i % 16)));
-        a = _mm256_xor_si256(a, b);
-        _mm256_storeu_si256((__m256i*)(dst + i), a);
+static inline void xor_chunk16(uint8_t *dst, const uint8_t *src, size_t n) {
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        dst[i] ^= src[i];
     }
-    for (; i + 16 <= n; i += 16) {
-        __m128i a = _mm_loadu_si128((__m128i*)(dst + i));
-        __m128i b = _mm_loadu_si128((__m128i*)(src + (i % 16)));
-        a = _mm_xor_si128(a, b);
-        _mm_storeu_si128((__m128i*)(dst + i), a);
-    }
-    for (; i < n; i++) {
-        dst[i] ^= src[i % 16];
-    }
-#elif defined(__SSE2__)
-    size_t i = 0;
-    for (; i + 16 <= n; i += 16) {
-        __m128i a = _mm_loadu_si128((__m128i*)(dst + i));
-        __m128i b = _mm_loadu_si128((__m128i*)(src + (i % 16)));
-        a = _mm_xor_si128(a, b);
-        _mm_storeu_si128((__m128i*)(dst + i), a);
-    }
-    for (; i < n; i++) {
-        dst[i] ^= src[i % 16];
-    }
-#else
-    size_t i = 0;
-    for (; i < n; i++) {
-        dst[i] ^= src[i % 16];
-    }
-#endif
 }
 
 void kuz_ctr_crypt_ctx(const kuz_key_t *ctx, const uint8_t *iv, uint8_t *data, size_t len) {
     uint8_t ctr[16];
     uint8_t gamma[16];
     size_t processed = 0;
+    size_t chunk;
 
     memcpy(ctr, iv, 16);
 
@@ -273,8 +241,8 @@ void kuz_ctr_crypt_ctx(const kuz_key_t *ctx, const uint8_t *iv, uint8_t *data, s
             if(ctr[i] != 0) break;
         }
 
-        size_t chunk = (len - processed < 16) ? (len - processed) : 16;
-        xor16_simd(data + processed, gamma, chunk);
+        chunk = (len - processed < 16) ? (len - processed) : 16;
+        xor_chunk16(data + processed, gamma, chunk);
         processed += chunk;
     }
 }
