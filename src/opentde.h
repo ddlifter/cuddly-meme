@@ -117,6 +117,7 @@ void opentde_ensure_key_directory(void);
 char *opentde_get_pgdata_path(void);
 void opentde_save_key_file(void);
 void opentde_forget_table_keys(Oid table_oid);
+void opentde_forget_all_table_keys(void);
 bool opentde_storage_key_exists(Oid storage_oid);
 void opentde_copy_active_storage_key(Oid source_storage_oid, Oid target_storage_oid);
 void opentde_reencrypt_relation_storage(Oid relation_oid);

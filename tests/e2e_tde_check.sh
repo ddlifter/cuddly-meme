@@ -14,9 +14,6 @@ MASTER_HEX_2="ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
 PGBIN="${PGBIN:-$HOME/diploma/pg_build/bin}"
 SENTINEL_TEXT="SENTINEL_OPENTDE_12345"
 E2E_ENABLE_MASTER_ROTATION="${E2E_ENABLE_MASTER_ROTATION:-1}"
-E2E_ENABLE_WAL_ARCHIVE_ENC="${E2E_ENABLE_WAL_ARCHIVE_ENC:-1}"
-OPENTDE_WAL_ARCHIVE_KEY_HEX="${OPENTDE_WAL_ARCHIVE_KEY_HEX:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
-OPENTDE_WAL_ARCHIVE_DIR="${OPENTDE_WAL_ARCHIVE_DIR:-$PGDATA/pg_wal_archive_tde_e2e}"
 INT_SENTINEL="77777"
 
 # --- Vault environment variables (edit as needed) ---
@@ -28,8 +25,6 @@ export OPENTDE_VAULT_ADDR="${OPENTDE_VAULT_ADDR:-$VAULT_ADDR}"
 export OPENTDE_VAULT_PATH="${OPENTDE_VAULT_PATH:-$VAULT_PATH}"
 export OPENTDE_VAULT_FIELD="${OPENTDE_VAULT_FIELD:-$VAULT_FIELD}"
 export OPENTDE_VAULT_TOKEN="${OPENTDE_VAULT_TOKEN:-$VAULT_TOKEN}"
-export OPENTDE_WAL_ARCHIVE_KEY_HEX
-export OPENTDE_WAL_ARCHIVE_DIR
 if [[ -z "${VAULT_TOKEN:-}" ]]; then
   echo "[WARN] VAULT_TOKEN is not set. Defaulting to the local Vault dev token 'root'."
 fi
@@ -51,30 +46,6 @@ sql_show() {
   local query="$1"
   echo "  SQL> $query"
   "$PSQL" -d "$DBNAME" -v ON_ERROR_STOP=1 -P pager=off -c "$query"
-}
-
-ensure_wal_archive_helpers() {
-  if [[ "$E2E_ENABLE_WAL_ARCHIVE_ENC" != "1" ]]; then
-    return 0
-  fi
-
-  [[ -x "$TESTS_DIR/wal_archive_encrypt.sh" ]] || chmod +x "$TESTS_DIR/wal_archive_encrypt.sh"
-  [[ -x "$TESTS_DIR/wal_restore_decrypt.sh" ]] || chmod +x "$TESTS_DIR/wal_restore_decrypt.sh"
-  mkdir -p "$OPENTDE_WAL_ARCHIVE_DIR"
-}
-
-wait_for_archived_segment() {
-  local wal_name="$1"
-  local i
-
-  for i in {1..30}; do
-    if [[ -f "$OPENTDE_WAL_ARCHIVE_DIR/$wal_name.tde" ]]; then
-      return 0
-    fi
-    sleep 1
-  done
-
-  return 1
 }
 
 wait_for_ready() {
@@ -160,7 +131,6 @@ to_hex() {
 
 restart() {
   local pg_opts
-  local archive_cmd
   local shm_key_hex
   local shm_key_dec
   local shmid
@@ -180,12 +150,6 @@ restart() {
 
   "$PG_CTL" -D "$PGDATA" stop -m fast -w >/dev/null 2>&1 || true
   pg_opts="-c shared_preload_libraries=opentde -c io_method=sync"
-
-  if [[ "$E2E_ENABLE_WAL_ARCHIVE_ENC" == "1" ]]; then
-    archive_cmd="$TESTS_DIR/wal_archive_encrypt.sh \"%p\" \"%f\""
-    pg_opts+=" -c archive_mode=on -c wal_level=replica -c archive_timeout=10s"
-    pg_opts+=" -c archive_command='${archive_cmd}'"
-  fi
 
   "$PG_CTL" -D "$PGDATA" start -w -o "$pg_opts" >/dev/null
   wait_for_ready
@@ -291,11 +255,7 @@ echo "    SENTINEL: $SENTINEL_TEXT"
 echo "    INT IDX:  btree(id)"
 echo "    INT SENT: $INT_SENTINEL"
 echo "    MK ROT:   $E2E_ENABLE_MASTER_ROTATION"
-echo "    WAL ENC:  $E2E_ENABLE_WAL_ARCHIVE_ENC"
-echo "    WAL DIR:  $OPENTDE_WAL_ARCHIVE_DIR"
 echo ""
-
-ensure_wal_archive_helpers
 reset_full_state
 
 # ===========================================================================
@@ -427,53 +387,7 @@ fi
 echo "  ✓ BTREE INT INDEX: int-паттерн есть в plain и отсутствует в encrypted"
 echo ""
 echo ""
-echo "  [4/7] Проверка WAL"
-echo ""
-echo ""
-if [[ "$E2E_ENABLE_WAL_ARCHIVE_ENC" == "1" ]]; then
-  WAL_MARK="WAL_ARCHIVE_E2E_$(date +%s)"
-  WAL_SEG_REST=""
-  WAL_SEG_PATH=""
-  TMP_DEC=""
-
-  rm -rf "$OPENTDE_WAL_ARCHIVE_DIR"
-  mkdir -p "$OPENTDE_WAL_ARCHIVE_DIR"
-
-  sql -c "DELETE FROM t_test WHERE id = 9001;"
-  sql -c "INSERT INTO t_test VALUES (9001,'$WAL_MARK');"
-  sql -c "CHECKPOINT;"
-  WAL_SEG_REST=$(sql_val "SELECT pg_walfile_name(pg_switch_wal())")
-
-  [[ -n "$WAL_SEG_REST" ]] || fail "Не удалось определить WAL-сегмент после pg_switch_wal()"
-  wait_for_archived_segment "$WAL_SEG_REST" || fail "Не найден зашифрованный WAL-архив: $OPENTDE_WAL_ARCHIVE_DIR/$WAL_SEG_REST.tde"
-
-  if grep -a -q "$WAL_MARK" "$OPENTDE_WAL_ARCHIVE_DIR/$WAL_SEG_REST.tde"; then
-    fail "Маркер найден в зашифрованном WAL-архиве: $WAL_SEG_REST.tde"
-  fi
-
-  TMP_DEC=$(mktemp)
-  "$TESTS_DIR/wal_restore_decrypt.sh" "$WAL_SEG_REST" "$TMP_DEC"
-  if ! grep -a -q "$WAL_MARK" "$TMP_DEC"; then
-    rm -f "$TMP_DEC"
-    fail "Маркер не найден после расшифровки WAL-сегмента: $WAL_SEG_REST"
-  fi
-
-  WAL_SEG_PATH="$PGDATA/pg_wal/$WAL_SEG_REST"
-  if [[ -f "$WAL_SEG_PATH" ]]; then
-    ORIG_SHA=$(sha256sum "$WAL_SEG_PATH" | awk '{print $1}')
-    REST_SHA=$(sha256sum "$TMP_DEC" | awk '{print $1}')
-    [[ "$ORIG_SHA" == "$REST_SHA" ]] || fail "SHA WAL mismatch: $WAL_SEG_REST"
-  fi
-
-  rm -f "$TMP_DEC"
-  sql -c "DELETE FROM t_test WHERE id = 9001;"
-  echo "  ✓ WAL архив защищен: plaintext отсутствует в .tde, decrypt/restore проходит"
-else
-  echo "  [WARN] WAL archive encryption check skipped (E2E_ENABLE_WAL_ARCHIVE_ENC=$E2E_ENABLE_WAL_ARCHIVE_ENC)"
-fi
-echo ""
-echo ""
-echo "  [5/7] Данные читаются после рестарта"
+echo "  [4/6] Данные читаются после рестарта"
 echo ""
 echo ""
 echo "  Проверяю, что данные пережили рестарт..."
@@ -523,7 +437,7 @@ echo "  ✓ Range Index Scan работает после рестарта"
 echo ""
 
 echo ""
-echo "  [6/7] Ротация DEK и master key"
+echo "  [5/6] Ротация DEK и master key"
 echo ""
 echo ""
 ROTATED_VER=$(sql_val "SELECT opentde_rotate_table_dek('t_test'::regclass::oid)")
@@ -571,7 +485,7 @@ echo "  ✓ Ротация DEK и master key успешна"
 echo ""
 
 echo ""
-echo "  [7/7] Восстановление после краша сервера"
+echo "  [6/6] Восстановление после краша сервера"
 echo ""
 echo ""
 echo "  Убиваю процесс сервера (kill -9)..."

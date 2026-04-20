@@ -738,12 +738,8 @@ opentde_forget_table_keys(Oid table_oid)
 
     opentde_ensure_keys_loaded();
 
-    if (!master_key_set || !global_key_mgr)
-    {
-        ereport(ERROR,
-                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-                 errmsg("master key is not set")));
-    }
+    if (!global_key_mgr)
+        opentde_init_key_manager();
 
     changed = false;
     write_idx = 0;
@@ -767,6 +763,18 @@ opentde_forget_table_keys(Oid table_oid)
         return;
 
     global_key_mgr->key_count = write_idx;
+    opentde_save_key_file();
+}
+
+void
+opentde_forget_all_table_keys(void)
+{
+    opentde_ensure_keys_loaded();
+
+    if (!global_key_mgr)
+        opentde_init_key_manager();
+
+    global_key_mgr->key_count = 0;
     opentde_save_key_file();
 }
 

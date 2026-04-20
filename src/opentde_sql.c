@@ -20,6 +20,7 @@ opentde_page_crypto_selftest(PG_FUNCTION_ARGS)
 #include "commands/defrem.h"
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
+#include "nodes/value.h"
 #include "tcop/utility.h"
 #include "utils/array.h"
 #include "utils/lsyscache.h"
@@ -34,6 +35,7 @@ PG_FUNCTION_INFO_V1(opentde_rotate_master_key);
 PG_FUNCTION_INFO_V1(opentde_rotate_table_dek_sql);
 PG_FUNCTION_INFO_V1(opentde_debug_keys);
 PG_FUNCTION_INFO_V1(opentde_get_dek_hex);
+PG_FUNCTION_INFO_V1(opentde_repair_relation_storage_sql);
 PG_FUNCTION_INFO_V1(opentde_blind_index);
 PG_FUNCTION_INFO_V1(opentde_blind_bucket_int4);
 PG_FUNCTION_INFO_V1(opentde_blind_bucket_int8);
@@ -131,6 +133,38 @@ opentde_collect_drop_storage_oids(DropStmt *stmt)
     }
 
     return storage_oids;
+}
+
+static bool
+opentde_dropstmt_targets_extension(DropStmt *stmt, const char *extname)
+{
+    ListCell *lc;
+
+    if (stmt->removeType != OBJECT_EXTENSION)
+        return false;
+
+    foreach(lc, stmt->objects)
+    {
+        Node *obj = (Node *) lfirst(lc);
+        Node *name_node = NULL;
+
+        if (obj == NULL)
+            continue;
+
+        if (IsA(obj, List))
+        {
+            List *names = (List *) obj;
+            if (list_length(names) > 0 && IsA(linitial(names), String))
+                name_node = (Node *) linitial(names);
+        }
+        else if (IsA(obj, String))
+            name_node = obj;
+
+        if (name_node != NULL && pg_strcasecmp(strVal(name_node), extname) == 0)
+            return true;
+    }
+
+    return false;
 }
 
 static bool
@@ -240,12 +274,10 @@ opentde_enable_table_family_encryption(Oid table_oid)
         Oid index_storage_oid;
 
         index_storage_oid = opentde_relation_storage_oid(index_oid);
-        if (!opentde_storage_key_exists(index_storage_oid))
-        {
-            opentde_copy_active_storage_key(rel->rd_locator.relNumber,
-                                            index_storage_oid);
-            opentde_reencrypt_relation_storage(index_oid);
-        }
+        opentde_forget_table_keys(index_storage_oid);
+        opentde_copy_active_storage_key(rel->rd_locator.relNumber,
+                                        index_storage_oid);
+        opentde_reencrypt_relation_storage(index_oid);
     }
 
     list_free(index_list);
@@ -305,11 +337,9 @@ opentde_maybe_encrypt_indexes_for_table(Oid table_oid)
         Oid index_storage_oid;
 
         index_storage_oid = opentde_relation_storage_oid(index_oid);
-        if (!opentde_storage_key_exists(index_storage_oid))
-        {
-            opentde_copy_active_storage_key(table_storage_oid, index_storage_oid);
-            opentde_reencrypt_relation_storage(index_oid);
-        }
+        opentde_forget_table_keys(index_storage_oid);
+        opentde_copy_active_storage_key(table_storage_oid, index_storage_oid);
+        opentde_reencrypt_relation_storage(index_oid);
     }
 
     list_free(index_list);
@@ -330,6 +360,8 @@ opentde_ProcessUtility(PlannedStmt *pstmt,
     Oid   saved_pending_index_parent_storage_oid = opentde_pending_index_parent_storage_oid;
     Oid   saved_pending_index_child_storage_oid = opentde_pending_index_child_storage_oid;
     List *drop_storage_oids = NIL;
+    bool  drop_opentde_extension = false;
+    bool  create_opentde_extension = false;
     ListCell *lc;
 
     opentde_pending_index_parent_storage_oid = InvalidOid;
@@ -349,7 +381,22 @@ opentde_ProcessUtility(PlannedStmt *pstmt,
     }
 
     if (IsA(parsetree, DropStmt))
+    {
         drop_storage_oids = opentde_collect_drop_storage_oids((DropStmt *) parsetree);
+        drop_opentde_extension = opentde_dropstmt_targets_extension((DropStmt *) parsetree,
+                                                                    "opentde");
+    }
+
+    if (IsA(parsetree, CreateExtensionStmt))
+    {
+        CreateExtensionStmt *stmt = (CreateExtensionStmt *) parsetree;
+
+        if (stmt->extname != NULL && pg_strcasecmp(stmt->extname, "opentde") == 0)
+            create_opentde_extension = true;
+    }
+
+    if (create_opentde_extension)
+        opentde_forget_all_table_keys();
 
     if (prev_ProcessUtility_hook)
         prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree,
@@ -358,16 +405,25 @@ opentde_ProcessUtility(PlannedStmt *pstmt,
         standard_ProcessUtility(pstmt, queryString, readOnlyTree,
                                 context, params, queryEnv, dest, qc);
 
-    if (!master_key_set)
-        goto done;
-
     if (drop_storage_oids != NIL)
     {
         foreach(lc, drop_storage_oids)
             opentde_forget_table_keys(lfirst_oid(lc));
 
+        if (drop_opentde_extension)
+            opentde_forget_all_table_keys();
+
         goto done;
     }
+
+    if (drop_opentde_extension)
+    {
+        opentde_forget_all_table_keys();
+        goto done;
+    }
+
+    if (create_opentde_extension)
+        goto done;
 
     if (IsA(parsetree, IndexStmt))
     {
@@ -711,6 +767,29 @@ opentde_get_dek_hex(PG_FUNCTION_ARGS)
 
     pfree(dek);
     PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+/*
+ * Maintenance helper: re-normalize relation storage in place.
+ * Useful for recovering mixed plaintext/encrypted pages without table rebuild.
+ */
+Datum
+opentde_repair_relation_storage_sql(PG_FUNCTION_ARGS)
+{
+    Oid relation_oid;
+
+    relation_oid = PG_GETARG_OID(0);
+
+    opentde_init_key_manager();
+    if (!master_key_set)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("master key is not set")));
+    }
+
+    opentde_reencrypt_relation_storage(relation_oid);
+    PG_RETURN_VOID();
 }
 
 /*
