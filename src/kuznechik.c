@@ -129,7 +129,11 @@ static void L(const uint8_t *in, uint8_t *out) {
         memmove(temp + 1, temp, 15);
         temp[0] = acc;
     }
+#ifdef __SSE2__
+    _mm_storeu_si128((__m128i*)out, _mm_loadu_si128((__m128i*)temp));
+#else
     memcpy(out, temp, 16);
+#endif
 #endif
 }
 

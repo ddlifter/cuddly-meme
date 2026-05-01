@@ -82,6 +82,8 @@ typedef struct {
     Oid     table_oid;                       /* OID таблицы */
     uint32_t key_version;                    /* Версия DEK таблицы */
     bool     is_active;                      /* true = активный DEK для новых записей */
+        kuz_key_t round_keys;                    /* Кэшированные раундовые ключи Kuznechik */
+        bool     round_keys_ready;               /* true, если round_keys инициализированы */
 } opentde_key_entry;
 
 typedef struct {

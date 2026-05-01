@@ -338,7 +338,6 @@ opentde_get_table_dek_by_version(Oid table_oid, uint32_t key_version)
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("master key not set")));
     }
-
     idx = opentde_find_table_key_index(table_oid, key_version);
     if (idx < 0)
     {
@@ -347,10 +346,7 @@ opentde_get_table_dek_by_version(Oid table_oid, uint32_t key_version)
                  errmsg("DEK version %u not found for table %u",
                         key_version, table_oid)));
     }
-
-    result_dek = palloc(DEK_SIZE);
-    memcpy(result_dek, global_key_mgr->keys[idx].dek, DEK_SIZE);
-    return result_dek;
+    return &global_key_mgr->keys[idx];
 }
 
 /*
@@ -362,7 +358,7 @@ opentde_get_table_dek(Oid table_oid)
     uint32_t key_version;
 
     key_version = opentde_get_active_table_key_version(table_oid);
-    return opentde_get_table_dek_by_version(table_oid, key_version);
+    return (uint8_t *)opentde_get_table_key_entry_by_version(table_oid, key_version);
 }
 
 /*
