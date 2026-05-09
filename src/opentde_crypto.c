@@ -26,11 +26,14 @@ opentde_wrap_dek(const uint8_t *master_key, const uint8_t *dek,
                  uint8_t *wrapped)
 {
     uint8_t iv[DATA_IV_SIZE];
+    kuz_key_t mk_ctx;
 
     opentde_fill_random_bytes(iv, DATA_IV_SIZE, "DEK wrapping IV");
     memcpy(wrapped, iv, DATA_IV_SIZE);
     memcpy(wrapped + DATA_IV_SIZE, dek, DEK_SIZE);
-    kuz_ctr_crypt(master_key, iv, wrapped + DATA_IV_SIZE, DEK_SIZE);
+
+    kuz_set_key(&mk_ctx, master_key);
+    kuz_ctr_crypt(&mk_ctx, iv, wrapped + DATA_IV_SIZE, DEK_SIZE);
 }
 
 /*
@@ -43,10 +46,13 @@ opentde_unwrap_dek(const uint8_t *master_key, const uint8_t *wrapped_dek,
                    uint8_t *dek)
 {
     uint8_t iv[DATA_IV_SIZE];
+    kuz_key_t mk_ctx;
 
     memcpy(iv, wrapped_dek, DATA_IV_SIZE);
     memcpy(dek, wrapped_dek + DATA_IV_SIZE, DEK_SIZE);
-    kuz_ctr_crypt(master_key, iv, dek, DEK_SIZE);
+
+    kuz_set_key(&mk_ctx, master_key);
+    kuz_ctr_crypt(&mk_ctx, iv, dek, DEK_SIZE);
     return true;
 }
 
@@ -329,7 +335,7 @@ uint8_t *
 opentde_get_table_dek_by_version(Oid table_oid, uint32_t key_version)
 {
     uint8_t *result_dek;
-    int      idx;
+    const uint8_t *dek_ptr;
 
     opentde_ensure_keys_loaded();
     if (!master_key_set || !global_key_mgr)
@@ -338,15 +344,11 @@ opentde_get_table_dek_by_version(Oid table_oid, uint32_t key_version)
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("master key not set")));
     }
-    idx = opentde_find_table_key_index(table_oid, key_version);
-    if (idx < 0)
-    {
-        ereport(ERROR,
-                (errcode(ERRCODE_INTERNAL_ERROR),
-                 errmsg("DEK version %u not found for table %u",
-                        key_version, table_oid)));
-    }
-    return &global_key_mgr->keys[idx];
+    dek_ptr = opentde_get_table_dek_ptr_by_version(table_oid, key_version);
+
+    result_dek = palloc(DEK_SIZE);
+    memcpy(result_dek, dek_ptr, DEK_SIZE);
+    return result_dek;
 }
 
 /*
@@ -358,7 +360,7 @@ opentde_get_table_dek(Oid table_oid)
     uint32_t key_version;
 
     key_version = opentde_get_active_table_key_version(table_oid);
-    return (uint8_t *)opentde_get_table_key_entry_by_version(table_oid, key_version);
+    return opentde_get_table_dek_by_version(table_oid, key_version);
 }
 
 /*

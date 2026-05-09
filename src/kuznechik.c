@@ -251,10 +251,12 @@ void kuz_ctr_crypt_ctx(const kuz_key_t *ctx, const uint8_t *iv, uint8_t *data, s
     }
 }
 
-// CTR режим для DEK (32 байта)
-void kuz_ctr_crypt(const uint8_t *key, const uint8_t *iv, uint8_t *data, size_t len) {
-    kuz_key_t ctx;
-    kuz_set_key(&ctx, key);
-
-    kuz_ctr_crypt_ctx(&ctx, iv, data, len);
+/*
+ * Generic CTR helper (uses pre-expanded round keys).
+ *
+ * NOTE: Keep the signature in sync with src/kuznechik.h.
+ */
+void kuz_ctr_crypt(const kuz_key_t *round_keys, const uint8_t *iv, uint8_t *data, size_t len)
+{
+    kuz_ctr_crypt_ctx(round_keys, iv, data, len);
 }

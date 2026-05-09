@@ -4,7 +4,6 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/aio.h"
-#include "storage/backendid.h"
 #include "access/table.h"
 #include "storage/bufpage.h"
 #include "storage/smgr.h"
@@ -12,10 +11,12 @@
 #include "storage/itemid.h"
 #include "access/htup_details.h"
 #include "access/transam.h"
+#include "catalog/pg_tablespace.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include <fcntl.h>
 #include <unistd.h>
+#include "storage/procnumber.h"
 
 PG_MODULE_MAGIC;
 
@@ -24,6 +25,38 @@ static bool md_smgr_hooked = false;
 static bool md_smgr_installing = false;
 extern Oid opentde_pending_index_parent_storage_oid;
 extern Oid opentde_pending_index_child_storage_oid;
+
+static bool opentde_enable_smgr_hook = true;
+static bool opentde_debug_smgr = false;
+
+#define OPENTDE_SPCOID(reln) ((reln) ? (reln)->smgr_rlocator.locator.spcOid : InvalidOid)
+#define OPENTDE_RELNUM(reln) ((reln) ? (reln)->smgr_rlocator.locator.relNumber : InvalidOid)
+
+static inline bool
+opentde_should_bypass_smgr(SMgrRelation reln)
+{
+    if (!opentde_enable_smgr_hook)
+        return true;
+
+    if (reln == NULL)
+        return true;
+
+    /*
+     * Never interfere with cluster-global relations (files in global/).
+     *
+     * With custom smgr chaining + async I/O, we may see spcOid reported as
+     * PG_DEFAULT_TABLESPACE_OID even for paths under global/ (e.g. rel 1260/1262),
+     * so we must whitelist-bypass by relation OID too.
+     */
+    if (reln->smgr_rlocator.locator.spcOid == GLOBALTABLESPACE_OID)
+        return true;
+
+    if (reln->smgr_rlocator.locator.relNumber == 1260 /* pg_database */ ||
+        reln->smgr_rlocator.locator.relNumber == 1262 /* pg_authid */)
+        return true;
+
+    return false;
+}
 
 static Oid
 relation_key_owner_oid(SMgrRelation reln)
@@ -309,6 +342,28 @@ encrypted_smgr_startreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknu
 {
     const char *io_method;
 
+    if (opentde_debug_smgr)
+        elog(LOG, "[OpenTDE][smgr] startreadv spcOid=%u rel=%u fork=%d blk=%u n=%u chain=%d",
+             OPENTDE_SPCOID(reln), OPENTDE_RELNUM(reln), (int) forknum, blocknum, nblocks, (int) chain_index);
+
+    if (opentde_should_bypass_smgr(reln))
+    {
+        if (opentde_debug_smgr)
+            elog(LOG, "[OpenTDE][smgr] startreadv BYPASS->md spcOid=%u rel=%u fork=%d blk=%u n=%u",
+                 OPENTDE_SPCOID(reln), OPENTDE_RELNUM(reln), (int) forknum, blocknum, nblocks);
+
+        /*
+         * For critical system relations the smgr chain/AIO path must be
+         * completely transparent. Using *_next() still goes through the chain
+         * and can hit a broken fd, so delegate directly to md.
+         */
+        if (original_md_smgr.smgr_startreadv)
+            original_md_smgr.smgr_startreadv(ioh, reln, forknum, blocknum, buffers, nblocks, 0);
+        else
+            original_md_smgr.smgr_readv(reln, forknum, blocknum, buffers, nblocks, 0);
+        return;
+    }
+
     smgr_startreadv_next(ioh, reln, forknum, blocknum, buffers, nblocks, chain_index + 1);
 
     io_method = GetConfigOption("io_method", true, false);
@@ -320,6 +375,16 @@ static void
 encrypted_smgr_readv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
                      void **buffers, BlockNumber nblocks, SmgrChainIndex chain_index)
 {
+    if (opentde_debug_smgr)
+        elog(LOG, "[OpenTDE][smgr] readv spcOid=%u rel=%u fork=%d blk=%u n=%u chain=%d",
+             OPENTDE_SPCOID(reln), OPENTDE_RELNUM(reln), (int) forknum, blocknum, nblocks, (int) chain_index);
+
+    if (opentde_should_bypass_smgr(reln))
+    {
+        original_md_smgr.smgr_readv(reln, forknum, blocknum, buffers, nblocks, chain_index + 1);
+        return;
+    }
+
     original_md_smgr.smgr_readv(reln, forknum, blocknum, buffers, nblocks, chain_index + 1);
     decrypt_read_buffers(reln, forknum, blocknum, buffers, nblocks);
 }
@@ -333,6 +398,17 @@ encrypted_smgr_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknu
     void **enc_raw_bufs;
     uint8_t key[DEK_SIZE];
     const kuz_key_t *kuz_ctx;
+
+    if (opentde_debug_smgr)
+        elog(LOG, "[OpenTDE][smgr] writev spcOid=%u rel=%u fork=%d blk=%u n=%u chain=%d",
+             OPENTDE_SPCOID(reln), OPENTDE_RELNUM(reln), (int) forknum, blocknum, nblocks, (int) chain_index);
+
+    if (opentde_should_bypass_smgr(reln))
+    {
+        original_md_smgr.smgr_writev(reln, forknum, blocknum, buffers,
+                                     nblocks, skipFsync, chain_index + 1);
+        return;
+    }
 
     enc_bufs = (void **) palloc(sizeof(void *) * nblocks);
     enc_raw_bufs = (void **) palloc(sizeof(void *) * nblocks);
@@ -382,6 +458,16 @@ encrypted_smgr_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknu
     uint8_t key[DEK_SIZE];
     const kuz_key_t *kuz_ctx;
 
+    if (opentde_debug_smgr)
+        elog(LOG, "[OpenTDE][smgr] extend spcOid=%u rel=%u fork=%d blk=%u chain=%d",
+             OPENTDE_SPCOID(reln), OPENTDE_RELNUM(reln), (int) forknum, blocknum, (int) chain_index);
+
+    if (opentde_should_bypass_smgr(reln))
+    {
+        original_md_smgr.smgr_extend(reln, forknum, blocknum, buffer, skipFsync, chain_index + 1);
+        return;
+    }
+
     if (forknum != MAIN_FORKNUM || !get_cached_table_crypto(reln, key, &kuz_ctx))
     {
         Oid storage_oid = relation_key_owner_oid(reln);
@@ -414,6 +500,16 @@ static void
 encrypted_smgr_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
                           int nblocks, bool skipFsync, SmgrChainIndex chain_index)
 {
+    if (opentde_debug_smgr)
+        elog(LOG, "[OpenTDE][smgr] zeroextend spcOid=%u rel=%u fork=%d blk=%u n=%d chain=%d",
+             OPENTDE_SPCOID(reln), OPENTDE_RELNUM(reln), (int) forknum, blocknum, nblocks, (int) chain_index);
+
+    if (opentde_should_bypass_smgr(reln))
+    {
+        original_md_smgr.smgr_zeroextend(reln, forknum, blocknum, nblocks, skipFsync, chain_index + 1);
+        return;
+    }
+
     original_md_smgr.smgr_zeroextend(reln, forknum, blocknum, nblocks, skipFsync, chain_index + 1);
 }
 
@@ -470,7 +566,7 @@ encrypted_smgr_create(RelFileLocator relold, SMgrRelation reln, ForkNumber forkn
         opentde_pending_index_child_storage_oid == InvalidOid &&
         forknum == MAIN_FORKNUM &&
         !isRedo &&
-        reln->smgr_rlocator.backend == InvalidBackendId)
+    reln->smgr_rlocator.backend == INVALID_PROC_NUMBER)
     {
         opentde_pending_index_child_storage_oid = reln->smgr_rlocator.locator.relNumber;
 
@@ -505,10 +601,22 @@ encrypted_smgr_init(void)
 static int
 encrypted_smgr_fd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off, SmgrChainIndex chain_index)
 {
-    if (off != NULL)
-        *off = 0;
+    int fd;
 
-    return -1;
+    /*
+     * This callback is important for async I/O and smgr fd reopen logic.
+     * A modifier must not “hide” the underlying fd, otherwise AIO workers can
+     * end up operating on an invalid descriptor (EBADF), especially during
+     * early startup reads of global relations.
+     */
+    fd = smgr_fd_next(reln, forknum, blocknum, off, chain_index + 1);
+
+    if (opentde_debug_smgr)
+        elog(LOG, "[OpenTDE][smgr] fd spcOid=%u rel=%u fork=%d blk=%u chain=%d -> fd=%d off=%u",
+             OPENTDE_SPCOID(reln), OPENTDE_RELNUM(reln), (int) forknum, blocknum,
+             (int) chain_index, fd, (off != NULL) ? *off : 0);
+
+    return fd;
 }
 void
 opentde_reencrypt_relation_storage(Oid relation_oid)
@@ -615,10 +723,15 @@ static const f_smgr encrypted_smgr = {
 void
 opentde_install_md_hooks(void)
 {
-    const char *current_chain;
-
     if (md_smgr_hooked || md_smgr_installing)
         return;
+
+    if (!opentde_enable_smgr_hook)
+    {
+        elog(LOG, "[OpenTDE] smgr hook disabled via opentde.enable_smgr_hook=off");
+        md_smgr_hooked = true;
+        return;
+    }
 
     md_smgr_installing = true;
 
@@ -627,17 +740,32 @@ opentde_install_md_hooks(void)
     elog(DEBUG1, "[OpenTDE] loaded keys, registering encrypted smgr");
     original_md_smgr = smgrsw[smgr_lookup("md")];
 
-    smgr_register(&encrypted_smgr, sizeof(SMgrRelationData));
+    /*
+     * Our smgr is a pure chain modifier and doesn't need per-relation private
+     * storage. Passing a non-zero size here is dangerous because PostgreSQL
+     * uses it to carve per-relation memory; a wrong size can corrupt state
+     * and manifest as invalid fds during I/O (e.g. "Bad file descriptor").
+     */
+    smgr_register(&encrypted_smgr, 0);
     elog(DEBUG1, "[OpenTDE] encrypted smgr registered");
 
-    current_chain = smgr_chain_string;
-    if (current_chain == NULL || current_chain[0] == '\0')
-        smgr_chain_string = psprintf("encrypted,md");
-    else if (strstr(current_chain, "encrypted") == NULL)
-        smgr_chain_string = psprintf("encrypted,%s", current_chain);
-
-    process_smgr_chain();
-    elog(DEBUG1, "[OpenTDE] smgr chain configured as '%s'", smgr_chain_string);
+    /*
+     * IMPORTANT:
+     * Do NOT rewrite smgr_chain_string or call process_smgr_chain() from a
+     * preload library.
+     *
+     * PostgreSQL already calls process_smgr_chain() during postmaster/backend
+     * startup after loading shared_preload_libraries, based on the GUC
+     * "smgr_chain".
+     *
+     * We observed that mutating the chain from here can corrupt/invalidates fds
+     * for early system relations (e.g. global/1260) under async I/O.
+     *
+     * To enable OpenTDE, set in postgresql.conf:
+     *   smgr_chain = 'encrypted,md'
+     */
+    elog(DEBUG1, "[OpenTDE] smgr chain not modified; current smgr_chain_string='%s'",
+         smgr_chain_string ? smgr_chain_string : "");
 
     md_smgr_hooked = true;
     md_smgr_installing = false;
@@ -648,6 +776,28 @@ _PG_init(void)
 {
     if (process_shared_preload_libraries_in_progress && !IsUnderPostmaster)
     {
+    DefineCustomBoolVariable("opentde.enable_smgr_hook",
+                 "Enable OpenTDE smgr hooks (diagnostic kill-switch).",
+                 NULL,
+                 &opentde_enable_smgr_hook,
+                 true,
+                 PGC_POSTMASTER,
+                 0,
+                 NULL,
+                 NULL,
+                 NULL);
+
+    DefineCustomBoolVariable("opentde.debug_smgr",
+                 "Log basic OpenTDE smgr hook activity.",
+                 NULL,
+                 &opentde_debug_smgr,
+                 false,
+                 PGC_POSTMASTER,
+                 0,
+                 NULL,
+                 NULL,
+                 NULL);
+
         opentde_install_md_hooks();
         opentde_init_utility_hooks();
     }

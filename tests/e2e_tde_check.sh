@@ -18,7 +18,11 @@ INT_SENTINEL="77777"
 
 # --- Vault environment variables (edit as needed) ---
 export VAULT_ADDR="${VAULT_ADDR:-${OPENTDE_VAULT_ADDR:-http://127.0.0.1:8200}}"
-export VAULT_PATH="${VAULT_PATH:-${OPENTDE_VAULT_PATH:-secret/pg_tde}}"
+## Vault dev server mounts `secret/` as KV v2 by default.
+## KV v2 read path:   /v1/secret/data/<name>
+## KV v1 read path:   /v1/secret/<name>
+## If your Vault mount is KV v1, override via VAULT_PATH/OPENTDE_VAULT_PATH.
+export VAULT_PATH="${VAULT_PATH:-${OPENTDE_VAULT_PATH:-secret/data/pg_tde}}"
 export VAULT_FIELD="${VAULT_FIELD:-${OPENTDE_VAULT_FIELD:-master_key}}"
 export VAULT_TOKEN="${VAULT_TOKEN:-${OPENTDE_VAULT_TOKEN:-root}}"
 export OPENTDE_VAULT_ADDR="${OPENTDE_VAULT_ADDR:-$VAULT_ADDR}"
@@ -27,6 +31,11 @@ export OPENTDE_VAULT_FIELD="${OPENTDE_VAULT_FIELD:-$VAULT_FIELD}"
 export OPENTDE_VAULT_TOKEN="${OPENTDE_VAULT_TOKEN:-$VAULT_TOKEN}"
 if [[ -z "${VAULT_TOKEN:-}" ]]; then
   echo "[WARN] VAULT_TOKEN is not set. Defaulting to the local Vault dev token 'root'."
+fi
+
+# Best-effort hint if user configured the KV v1 path against KV v2 mount.
+if [[ "${VAULT_PATH:-}" == "secret/pg_tde" ]]; then
+  echo "[WARN] VAULT_PATH is set to 'secret/pg_tde'. If your Vault uses KV v2 (default for dev), use 'secret/data/pg_tde' instead."
 fi
 
 PSQL="$PGBIN/psql"

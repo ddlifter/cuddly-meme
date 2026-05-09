@@ -10,7 +10,7 @@ OBJS = src/kuznechik.o src/opentde_crypto.o src/opentde_keymanager.o src/opentde
 SRCS = src/kuznechik.c src/opentde_crypto.c src/opentde_keymanager.c src/opentde_sql.c src/pg_encrypted_smgr.c src/opentde_pagestore.c
 
 # Подключаем конфигурацию PostgreSQL
-PG_CONFIG = /home/ddlifter/diploma/pg_build/bin/pg_config
+PG_CONFIG = /home/winter/pg19-customsmgr/bin/pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
@@ -18,6 +18,17 @@ include $(PGXS)
 # Убедись, что стоят пакеты libssl-dev и libcurl4-openssl-dev
 SHLIB_LINK += -lssl -lcrypto -lcurl
 
-PG_CFLAGS += -O3 -DNDEBUG -flto
-PG_CPPFLAGS += -Isrc -I/home/ddlifter/diploma/pg_build/include/postgresql/server -I/home/ddlifter/diploma/pg_build/include/postgresql
-SHLIB_LINK += -flto
+# Не навязываем оптимизации (-O3/-flto/-DNDEBUG): расширение должно собираться
+# теми же флагами, что и текущая сборка PostgreSQL (у вас она отладочная).
+
+# Заголовки расширения
+PG_CPPFLAGS += -Isrc
+
+# Важно: расширение использует некоторые внутренние заголовки PostgreSQL,
+# которые не всегда устанавливаются в $(includedir-server) при `make install`.
+# Поэтому добавляем путь к дереву исходников PostgreSQL.
+#
+# Примечание: для гарантии, что ключи -I попадут в фактическую команду компиляции
+# (через PGXS), добавляем путь также в CPPFLAGS.
+PG_CPPFLAGS += -I/home/winter/postgres/src/include
+override CPPFLAGS += -I/home/winter/postgres/src/include
